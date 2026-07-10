@@ -1,0 +1,21 @@
+.DS_Store
+
+# ESP-IDF build output
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig.old
+
+# Local release packages generated for review/upload
+dist/
+
+# Local backups and large reference material kept outside the public repo
+backups/
+硬件资料/
+Part-DB-server-master/
+喵哎 ESP32 S3 墨水屏/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.tmp

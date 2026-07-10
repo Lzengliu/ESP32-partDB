@@ -1,0 +1,41 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "app_config.c"
+        "button_input.c"
+        "camera_mgr.c"
+        "device_ui.c"
+        "display_ili9488.c"
+        "hardware_diag.c"
+        "http_server.c"
+        "i2c_bus.c"
+        "nfc_i2c.c"
+        "nfc_pn532.c"
+        "nfc_service.c"
+        "partdb_client.c"
+        "peripheral_arbiter.c"
+        "qr_scanner.c"
+        "soft_i2c.c"
+        "storage_sd.c"
+        "touch_ft6336.c"
+        "ui_font.c"
+        "wifi_portal.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        app_update
+        driver
+        esp32-camera
+        esp_event
+        esp_driver_sdmmc
+        esp_http_client
+        esp_http_server
+        esp_netif
+        esp_timer
+        esp_wifi
+        fatfs
+        json
+        nvs_flash
+        quirc
+        sdmmc
+        vfs
+)
