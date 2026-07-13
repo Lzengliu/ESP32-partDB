@@ -1,18 +1,18 @@
-# V1.1 Known Issues
+# V1.11 Known Issues
 
 [Chinese Version](KNOWN_ISSUES.md)
 
-Version: V1.1
+Version: V1.11
 
-## Manual Camera Focus Only
+## AF Depends on the Complete Lens Assembly
 
-The installed camera module does not support autofocus. If QR edges are unclear, or decoding still reports ECC/no-result errors, rotate the lens manually and ensure that the code is large enough, well lit, and stationary. The nonfunctional autofocus controls were removed, and manual focus is not considered a V1.1 release blocker.
+The firmware provides a separate AF button and `/api/camera/af`. AF runs only after an explicit user action and never during startup, preview, or scanning. The driver can identify an OV5640 sensor, but the sensor PID alone cannot prove that the lens assembly contains a voice-coil actuator. A fixed-focus or actuator-free module may report an AF status without physically moving the lens. In that case, rotate the lens manually and keep the QR code large enough, well lit, and stationary.
 
-The camera normally sleeps and releases its driver. If Preview or Scan has not yet woken and warmed up the sensor, the web Overview or Hardware Diagnostics page may show Camera as abnormal. This is expected and does not indicate a damaged module; starting a preview or scan initializes the camera on demand.
+The camera normally sleeps and releases its driver after a short idle interval. If Preview or Scan has not yet woken and warmed up the sensor, the web Overview or Hardware Diagnostics page may show Camera as abnormal. This is expected and does not indicate a damaged module; starting a preview or scan initializes the camera on demand.
 
 ## No Authentication on the Web Management Interface
 
-The web page and `/api/*` management endpoints do not currently enforce authentication. They include configuration changes, TF card formatting, resource deletion, and OTA. Deploy V1.1 only on a trusted local network and do not expose the device directly to the public internet. A later version should add login or device-key verification, CSRF protection, and permission levels for destructive actions.
+The web page and `/api/*` management endpoints do not currently enforce authentication. They include configuration changes, TF card formatting, resource deletion, and OTA. Deploy V1.11 only on a trusted local network and do not expose the device directly to the public internet. A later version should add login or device-key verification, CSRF protection, and permission levels for destructive actions.
 
 ## External Fonts Are Not Used for Runtime Rendering
 

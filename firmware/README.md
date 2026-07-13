@@ -1,6 +1,6 @@
 # ESP32 Part-DB Terminal Firmware
 
-Current stable release: **V1.1**
+Current stable release: **V1.11**
 
 - Author: 灵异大队长
 - Repository: https://github.com/Lzengliu/ESP32-partDB

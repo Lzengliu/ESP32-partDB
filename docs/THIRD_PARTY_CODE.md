@@ -1,10 +1,10 @@
 # 引用代码与第三方组件说明
 
-版本：V1.1
+版本：V1.11
 
 ## ESP-IDF 与管理组件
 
-V1.1 使用 ESP-IDF v5.5.2，目标为 ESP32-S3。`firmware/dependencies.lock` 锁定：
+V1.11 使用 ESP-IDF v5.5.2，目标为 ESP32-S3。`firmware/dependencies.lock` 锁定：
 
 | 组件 | 版本 | 用途 | 协议 |
 | --- | --- | --- | --- |

@@ -2,7 +2,7 @@
 
 [Chinese Version](FEATURES.md)
 
-Version: V1.1
+Version: V1.11
 
 ## Part-DB
 
@@ -24,18 +24,20 @@ Version: V1.1
 - Save network, Part-DB, display, touch, and resource settings.
 - Manage TF card files, backgrounds, boot images, lock images, and font files.
 - Run hardware diagnostics, camera preview, local scanning, and OTA updates.
+- The Overview and Hardware Diagnostics pages provide a separate AF button; AF runs only after an explicit click.
 - Show the author, Lingyi Daduizhang (灵异大队长), and the source repository.
 
 ## Camera and QR Scanning
 
-- PSRAM frame buffers and SVGA grayscale scan frames.
+- PSRAM frame buffers and a VGA grayscale fast path; the scanner conditionally upgrades to SVGA only after QR geometry is detected but decoding fails.
 - Exposure warm-up can finish early based on measured image brightness.
-- Fast ZXing-C++ decoding, quirc fallback, and a conditional second-frame retry.
+- Fast ZXing-C++ decoding with quirc fallback; luma buffers, the quirc context, and matching camera configurations are reused so consecutive scans skip redundant warm-up.
 - `/api/camera.jpg` provides preview images; `/api/camera/scan` runs local decoding.
+- `/api/camera/af` triggers OV5640 AF in manual mode. Startup, preview, and scan paths never run AF automatically.
 
-The installed camera module has no autofocus. Rotate the lens manually until the QR edges are sharp. See [Known Issues](KNOWN_ISSUES_EN.md).
+Fixed-focus modules and modules without a lens actuator still require physical lens adjustment. See [Known Issues](KNOWN_ISSUES_EN.md).
 
-The camera is enabled on demand and normally sleeps and releases its driver after an operation. Before a preview or scan has woken and warmed up the sensor, Camera may appear abnormal in the web Overview and Hardware Diagnostics pages; this is expected.
+The camera is enabled on demand and sleeps and releases its driver after a short idle interval. Before a preview or scan has woken and warmed up the sensor, Camera may appear abnormal in the web Overview and Hardware Diagnostics pages; this is expected.
 
 ## NFC
 
@@ -55,3 +57,4 @@ The camera is enabled on demand and normally sleeps and releases its driver afte
 - Empty-image and partition-capacity validation before OTA writes.
 - Bootloader rollback is enabled; the new image is confirmed only after core services start successfully.
 - Status APIs expose firmware version, author, repository, and hardware diagnostics.
+- A low-priority runtime guard samples internal RAM and PSRAM, releases scanner caches and idle camera resources under memory pressure, and checks heap integrity every five minutes. It does not hide faults behind periodic reboots.

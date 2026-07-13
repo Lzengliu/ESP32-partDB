@@ -33,6 +33,7 @@
 #include "psram_diag.h"
 #include "storage_sd.h"
 #include "qr_scanner.h"
+#include "runtime_guard.h"
 #include "touch_ft6336.h"
 #include "ui_font.h"
 #include "wifi_portal.h"
@@ -123,12 +124,12 @@ static const char INDEX_HTML[] =
 "<div class=\"top\"><div><h1 id=\"device_title\">Part-DB Terminal</h1><div id=\"headline\" class=\"muted\">loading...</div></div><button onclick=\"loadAll()\">刷新</button></div>"
 "<div class=\"cards\"><div class=\"metric\"><b>WiFi</b><span id=\"m_wifi\">-</span></div><div class=\"metric\"><b>AP</b><span id=\"m_ap\">-</span></div><div class=\"metric\"><b>Part-DB</b><span id=\"m_partdb\">-</span></div><div class=\"metric\"><b>TF 卡</b><span id=\"m_tf\">-</span></div><div class=\"metric\"><b>硬件</b><span id=\"m_hw\">-</span></div></div>"
 "<div class=\"tabs\"><button class=\"active\" data-tab=\"overview\" onclick=\"tab('overview')\">总览</button><button data-tab=\"settings\" onclick=\"tab('settings')\">设置</button><button data-tab=\"partdb\" onclick=\"tab('partdb')\">Part-DB</button><button data-tab=\"hardware\" onclick=\"tab('hardware')\">硬件</button><button data-tab=\"resources\" onclick=\"tab('resources')\">资源</button><button data-tab=\"maintenance\" onclick=\"tab('maintenance')\">维护</button></div>"
-"<section id=\"overview\" class=\"panel active\"><div class=\"grid\"><div class=\"box\"><h2>运行状态</h2><div id=\"status_cards\" class=\"statusrow\"></div><pre id=\"status\" class=\"api-log\"></pre></div><div class=\"box\"><h2>快速操作</h2><button onclick=\"enableAp()\">开启 AP</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">预览抓图</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"msg\" class=\"msg\"></p><div id=\"qr_result\"></div><div id=\"camera_preview\" class=\"camview\"></div></div></div></section>"
+"<section id=\"overview\" class=\"panel active\"><div class=\"grid\"><div class=\"box\"><h2>运行状态</h2><div id=\"status_cards\" class=\"statusrow\"></div><pre id=\"status\" class=\"api-log\"></pre></div><div class=\"box\"><h2>快速操作</h2><button onclick=\"enableAp()\">开启 AP</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">预览抓图</button><button onclick=\"manualAf()\">AF 对焦</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"msg\" class=\"msg\"></p><div id=\"qr_result\"></div><div id=\"camera_preview\" class=\"camview\"></div></div></div></section>"
 "<section id=\"settings\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>网络</h2><label>设备名称</label><input id=\"device_name\" data-cfg maxlength=\"47\"><label>WiFi SSID</label><input id=\"wifi_ssid\" data-cfg><label>WiFi 密码</label><input id=\"wifi_pass\" data-cfg type=\"password\" placeholder=\"留空则不修改已保存密码\"><label class=\"inline\"><input id=\"ap_enabled\" data-cfg type=\"checkbox\">启用配置 AP</label><button class=\"primary\" onclick=\"saveCfg()\">保存并重连</button></div>"
 "<div class=\"box\"><h2>资源路径</h2><label>开机图路径</label><p id=\"fixed_boot_image_path\" class=\"muted\"></p><label>字体目录</label><p id=\"fixed_font_dir\" class=\"muted\"></p><label>字体文件</label><select id=\"font_path\" data-cfg onchange=\"fontSelectionChanged()\"><option value=\"\">默认内置字体</option></select><input id=\"font_file\" type=\"file\" accept=\".ttf,.otf,.ttc,.woff,.woff2\"><button onclick=\"uploadFont()\">上传字体</button><button onclick=\"loadFonts()\">刷新字体</button><button id=\"font_delete\" class=\"danger\" onclick=\"deleteFont()\">删除所选字体</button><button class=\"primary\" onclick=\"saveResourceCfg()\">保存字体设置</button><p id=\"font_msg\" class=\"msg\"></p><p id=\"font_count\" class=\"muted\"></p></div>"
 "<div class=\"box\"><h2>显示</h2><label>显示驱动</label><select id=\"display_driver\" data-cfg><option value=\"ili9488\">ILI9488 SPI</option></select><label>屏幕尺寸</label><select id=\"display_preset\" onchange=\"setDisplayPreset(this.value)\"><option value=\"320x480\">320 x 480</option><option value=\"480x320\">480 x 320</option><option value=\"240x320\">240 x 320</option><option value=\"240x240\">240 x 240</option><option value=\"custom\">自定义</option></select><div class=\"inline\"><input id=\"display_width\" data-cfg type=\"number\" min=\"64\" max=\"1024\"><input id=\"display_height\" data-cfg type=\"number\" min=\"64\" max=\"1024\"></div><label>方向</label><select id=\"display_orientation\" data-cfg><option value=\"portrait\">竖屏</option><option value=\"landscape\">横屏</option></select><label class=\"inline\"><input id=\"display_flip\" data-cfg type=\"checkbox\">翻转 180°</label><label>触摸旋转</label><select id=\"touch_rotation\" data-cfg><option value=\"0\">0°</option><option value=\"1\">90°</option><option value=\"2\">180°</option><option value=\"3\">270°</option></select><label>触摸原始范围</label><div class=\"inline\"><input id=\"touch_raw_width\" data-cfg type=\"number\" min=\"64\" max=\"1024\"><input id=\"touch_raw_height\" data-cfg type=\"number\" min=\"64\" max=\"1024\"></div><label class=\"inline\"><input id=\"touch_swap_xy\" data-cfg type=\"checkbox\">交换触摸 X/Y</label><label class=\"inline\"><input id=\"touch_flip_x\" data-cfg type=\"checkbox\">触摸 X 翻转</label><label class=\"inline\"><input id=\"touch_flip_y\" data-cfg type=\"checkbox\">触摸 Y 翻转</label><label>屏幕亮度 <span id=\"brightness_value\"></span></label><input id=\"display_brightness\" data-cfg type=\"range\" min=\"0\" max=\"100\" step=\"5\" oninput=\"brightness_value.textContent=this.value+'%'\" onchange=\"setBrightness(this.value)\"><label>自动息屏</label><select id=\"screen_sleep_minutes\" data-cfg><option value=\"5\">5 分钟</option><option value=\"10\">10 分钟</option><option value=\"15\">15 分钟</option><option value=\"30\">30 分钟</option><option value=\"60\">60 分钟</option></select></div></div></section>"
 "<section id=\"partdb\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>接口配置</h2><label>Part-DB 地址</label><input id=\"partdb_url\" data-cfg placeholder=\"http://partdb.local 或 http://partdb.local/api\"><label>Part-DB API Token</label><input id=\"partdb_token\" data-cfg type=\"password\"><label>诊断上传地址</label><input id=\"camera_upload_url\" data-cfg placeholder=\"仅用于手动抓图上传诊断\"><button class=\"primary\" onclick=\"savePartdbCfg()\">保存接口</button><button onclick=\"partdbGet('/api/parts.jsonld?itemsPerPage=1')\">测试元件列表</button><button onclick=\"partdbGet('/api/categories.jsonld?itemsPerPage=1')\">测试分类</button><p id=\"partdb_msg\" class=\"msg\"></p><p class=\"muted\">扫码链路只使用 ESP32 本地解码；此地址只给 /api/camera/upload 诊断接口使用。</p><pre id=\"partdb_out\" class=\"api-log\"></pre></div></div></section>"
-"<section id=\"hardware\" class=\"panel\"><div class=\"box\"><h2>硬件诊断</h2><div id=\"hw_cards\" class=\"statusrow\"></div><button class=\"primary\" onclick=\"runHardwareDiag()\">重新诊断</button><button onclick=\"diag('/api/display/test')\">显示测试</button><button onclick=\"diag('/api/touch')\">读取触摸</button><button onclick=\"diag('/api/nfc/read')\">读取 NFC</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">预览抓图</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"hw_msg\" class=\"msg\"></p><div id=\"hw_qr_result\"></div><div id=\"hw_camera_preview\" class=\"camview\"></div><pre id=\"hw_out\" class=\"api-log\"></pre></div></section>"
+"<section id=\"hardware\" class=\"panel\"><div class=\"box\"><h2>硬件诊断</h2><div id=\"hw_cards\" class=\"statusrow\"></div><button class=\"primary\" onclick=\"runHardwareDiag()\">重新诊断</button><button onclick=\"diag('/api/display/test')\">显示测试</button><button onclick=\"diag('/api/touch')\">读取触摸</button><button onclick=\"diag('/api/nfc/read')\">读取 NFC</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">预览抓图</button><button onclick=\"manualAf()\">AF 对焦</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"hw_msg\" class=\"msg\"></p><div id=\"hw_qr_result\"></div><div id=\"hw_camera_preview\" class=\"camview\"></div><pre id=\"hw_out\" class=\"api-log\"></pre></div></section>"
 "<section id=\"resources\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>TF 卡</h2><div class=\"bar\"><i id=\"sd_bar\"></i></div><p id=\"sd_text\" class=\"muted\">未挂载</p><button onclick=\"mountSd()\">挂载/刷新</button><button onclick=\"prepareSd()\">初始化目录</button><button class=\"danger\" onclick=\"formatSd()\">格式化 TF</button><p class=\"muted\">格式化会清空整张卡；固件只把 TF 卡用于缓存、屏保、开机动画和字体。</p></div>"
 "<div class=\"box\"><h2>上传资源</h2><label>资源类型</label><select id=\"asset_kind\" onchange=\"assetKindChanged()\"><option value=\"screen_bg\">屏幕背景图</option><option value=\"boot_image\">静态开机图</option><option value=\"boot_anim\">开机动态图片</option><option value=\"lock_bg\">锁屏背景图</option></select><input id=\"asset_file\" type=\"file\" accept=\"image/*\"><label id=\"fit_label\">图片适配</label><select id=\"fit_mode\"><option value=\"contain\">完整显示</option><option value=\"cover\">铺满裁切</option></select><button class=\"primary\" onclick=\"uploadAsset()\">上传</button><p id=\"asset_msg\" class=\"msg\"></p></div></div>"
 "<div id=\"asset_cards\" class=\"assetgrid\"></div><div class=\"browser\"><div class=\"box\" hidden><h2>文件</h2><div class=\"pathbar\"><button onclick=\"openSd('/')\">根目录</button><button onclick=\"openParent()\">上一级</button><span id=\"sd_path\" class=\"muted\">/</span></div><div id=\"sd_files\" class=\"filegrid\"></div><p id=\"res_msg\" class=\"msg\"></p><pre id=\"res_out\" class=\"api-log\"></pre></div><div class=\"preview\"><h2>预览</h2><div class=\"muted\">boot_image_path</div><p id=\"path_boot\" class=\"muted\"></p><div class=\"muted\">font_dir</div><p id=\"path_font\" class=\"muted\"></p><div class=\"muted\">font_path</div><p id=\"path_font_file\" class=\"muted\"></p><div id=\"file_preview\"></div></div></div></section>"
@@ -147,7 +148,7 @@ static const char INDEX_HTML[] =
 "async function loadStatus(){renderStatus(await j('/api/status'))}async function loadAll(){await loadConfig();await loadFonts();assetKindChanged();await loadStatus();await loadAssets()}async function savePartialConfig(body){return await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}async function saveCfg(){let body={};['device_name','wifi_ssid','wifi_pass','partdb_url','partdb_token','camera_upload_url','font_path','display_driver','display_orientation'].forEach(k=>body[k]=$(k).value);body.ap_enabled=$('ap_enabled').checked;body.display_flip=$('display_flip').checked;body.touch_rotation=Number($('touch_rotation').value)||0;body.touch_swap_xy=$('touch_swap_xy').checked;body.touch_flip_x=$('touch_flip_x').checked;body.touch_flip_y=$('touch_flip_y').checked;body.display_brightness=Number($('display_brightness').value);body.screen_sleep_minutes=Number($('screen_sleep_minutes').value)||5;body.display_width=Number($('display_width').value)||320;body.display_height=Number($('display_height').value)||480;body.touch_raw_width=Number($('touch_raw_width').value)||320;body.touch_raw_height=Number($('touch_raw_height').value)||480;let r=await savePartialConfig(body);say(r.ok?'已保存，正在重连':'保存失败 '+r.err);editing=false;loaded=false;$('wifi_pass').value='';$('partdb_token').value='';setTimeout(loadAll,900)}"
 "async function saveResourceCfg(){let body={font_path:$('font_path').value};let r=await savePartialConfig(body);$('font_msg').textContent=r.ok?'字体设置已保存':'保存失败 '+r.err;editing=false;loaded=false;await loadConfig();await loadFonts()}"
 "async function setBrightness(v){$('brightness_value').textContent=v+'%';await j('/api/display/brightness',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_brightness:Number(v)})});loadStatus()}async function enableAp(){let r=await j('/api/wifi/ap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true})});say(r.ok?'AP 已开启':'开启 AP 失败 '+r.err);loadStatus()}"
-"async function screenPower(awake){await j('/api/display/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({awake:!!awake})});loadStatus()}async function diag(u){let r=await j(u);$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok===false?('执行失败 '+r.err):'已执行，详细日志看串口';loadStatus()}async function runHardwareDiag(){$('hw_msg').textContent='正在诊断...';let r=await j('/api/hardware/diagnose',{method:'POST'});$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok?'诊断完成':'诊断失败 '+r.err;loadStatus()}function renderQr(r){r=r||{};let found=!!r.found,meta=(r.width||0)+'x'+(r.height||0)+' · '+(r.elapsed_ms||0)+' ms · '+(r.err||'');let html='<div class=\"scanbox\"><b>'+(found?'识别到二维码':'未识别到二维码')+'</b>'+(found?'<code>'+esc(r.text||'')+'</code>':'')+'<div class=\"muted\">'+esc(meta)+'</div></div>';$('qr_result').innerHTML=html;$('hw_qr_result').innerHTML=html}async function scanQr(){say('正在扫码...');$('hw_msg').textContent='正在扫码...';try{let r=await j('/api/camera/scan',{method:'POST'});renderQr(r);let msg=r.found?'扫码成功':(r.ok?'未识别到二维码':'扫码失败 '+r.err);say(msg);$('hw_msg').textContent=msg}catch(e){say('扫码失败 '+e.message);$('hw_msg').textContent='扫码失败 '+e.message}loadStatus()}async function captureCamera(){say('正在获取预览...');$('hw_msg').textContent='正在获取预览...';try{let r=await fetch('/api/camera.jpg?t='+Date.now());if(!r.ok)throw new Error('HTTP '+r.status);let b=await r.blob(),u=URL.createObjectURL(b);if(window.cameraUrl)URL.revokeObjectURL(window.cameraUrl);window.cameraUrl=u;let html='<img src=\"'+u+'\" alt=\"camera\">';$('camera_preview').innerHTML=html;$('hw_camera_preview').innerHTML=html;say('预览已刷新');$('hw_msg').textContent='预览已刷新'}catch(e){say('预览失败 '+e.message);$('hw_msg').textContent='预览失败 '+e.message}loadStatus()}async function otaUpload(){let f=$('ota').files[0];if(!f){$('ota_msg').textContent='请选择固件';return}let r=await fetch('/api/ota',{method:'POST',body:f});$('ota_msg').textContent=await r.text()}"
+"async function screenPower(awake){await j('/api/display/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({awake:!!awake})});loadStatus()}async function diag(u){let r=await j(u);$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok===false?('执行失败 '+r.err):'已执行，详细日志看串口';loadStatus()}async function runHardwareDiag(){$('hw_msg').textContent='正在诊断...';let r=await j('/api/hardware/diagnose',{method:'POST'});$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok?'诊断完成':'诊断失败 '+r.err;loadStatus()}function renderQr(r){r=r||{};let found=!!r.found,meta=(r.width||0)+'x'+(r.height||0)+' · '+(r.elapsed_ms||0)+' ms · '+(r.err||'');let html='<div class=\"scanbox\"><b>'+(found?'识别到二维码':'未识别到二维码')+'</b>'+(found?'<code>'+esc(r.text||'')+'</code>':'')+'<div class=\"muted\">'+esc(meta)+'</div></div>';$('qr_result').innerHTML=html;$('hw_qr_result').innerHTML=html}async function scanQr(){say('正在扫码...');$('hw_msg').textContent='正在扫码...';try{let r=await j('/api/camera/scan',{method:'POST'});renderQr(r);let msg=r.found?'扫码成功':(r.ok?'未识别到二维码':(r.camera_in_use?'相机正在被其他操作占用':'扫码失败 '+r.err));say(msg);$('hw_msg').textContent=msg}catch(e){say('扫码失败 '+e.message);$('hw_msg').textContent='扫码失败 '+e.message}loadStatus()}async function manualAf(){say('正在手动触发 AF...');$('hw_msg').textContent='正在手动触发 AF...';try{let r=await j('/api/camera/af',{method:'POST'}),msg=r.ok?'AF 对焦完成':(r.camera_in_use?'相机正在被其他操作占用':(r.supported?'AF 未合焦 '+r.err:'当前相机不支持 AF'));say(msg);$('hw_msg').textContent=msg;$('hw_out').textContent=JSON.stringify(r,null,2)}catch(e){say('AF 失败 '+e.message);$('hw_msg').textContent='AF 失败 '+e.message}loadStatus()}async function captureCamera(){say('正在获取预览...');$('hw_msg').textContent='正在获取预览...';try{let r=await fetch('/api/camera.jpg?t='+Date.now());if(!r.ok)throw new Error('HTTP '+r.status);let b=await r.blob(),u=URL.createObjectURL(b);if(window.cameraUrl)URL.revokeObjectURL(window.cameraUrl);window.cameraUrl=u;let html='<img src=\"'+u+'\" alt=\"camera\">';$('camera_preview').innerHTML=html;$('hw_camera_preview').innerHTML=html;say('预览已刷新');$('hw_msg').textContent='预览已刷新'}catch(e){say('预览失败 '+e.message);$('hw_msg').textContent='预览失败 '+e.message}loadStatus()}async function otaUpload(){let f=$('ota').files[0];if(!f){$('ota_msg').textContent='请选择固件';return}let r=await fetch('/api/ota',{method:'POST',body:f});$('ota_msg').textContent=await r.text()}"
 "async function savePartdbCfg(){let body={partdb_url:$('partdb_url').value,partdb_token:$('partdb_token').value,camera_upload_url:$('camera_upload_url').value};let r=await savePartialConfig(body);$('partdb_msg').textContent=r.ok?'接口已保存':'保存失败 '+r.err;$('partdb_token').value='';editing=false;loaded=false;loadStatus()}async function partdbGet(path){let r=await j('/api/partdb/get',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path})});$('partdb_out').textContent=JSON.stringify(r,null,2);$('partdb_msg').textContent=r.ok?'测试通过，详细响应看串口':'测试失败 HTTP '+(r.http_status||0)+' '+r.err;loadStatus()}"
 "function fontSelectionChanged(){let p=$('font_path').value;$('font_delete').disabled=!p;$('path_font_file').textContent=p||'默认内置字体'}"
 "async function loadFonts(){let sel=$('font_path'),cur=lastConfig.font_path||sel.value||'';try{let r=await j('/api/fonts/list');let html='<option value=\"\">默认内置字体</option>';(r.entries||[]).forEach(e=>{html+='<option value=\"'+esc(e.path)+'\">'+esc(e.name)+' · '+fmt(e.size)+'</option>'});sel.innerHTML=html;sel.value=cur;if(sel.value!==cur)sel.value='';fontSelectionChanged();$('font_count').textContent=r.ok?((r.count||0)+' 个字体文件'):'读取字体目录失败 '+r.err}catch(e){$('font_count').textContent='读取字体目录失败 '+e.message;fontSelectionChanged()}}"
@@ -1541,6 +1542,8 @@ static esp_err_t status_get(httpd_req_t *req)
     hardware_diag_status_t diag = hardware_diag_get_status();
     nfc_service_status_t nfc = nfc_service_get_status();
     qr_scanner_status_t qr = qr_scanner_get_status();
+    camera_af_result_t af = camera_mgr_get_af_status();
+    runtime_guard_status_t runtime = runtime_guard_get_status();
     button_input_status_t buttons = button_input_get_status();
     const esp_app_desc_t *app = esp_app_get_description();
 
@@ -1598,6 +1601,16 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(hw, "nfc_ready", nfc_pn532_is_ready());
     cJSON_AddBoolToObject(hw, "camera_active", camera_mgr_is_active());
     cJSON_AddBoolToObject(hw, "camera_keep_online", camera_mgr_should_keep_online());
+    cJSON *jaf = cJSON_AddObjectToObject(hw, "autofocus");
+    cJSON_AddBoolToObject(jaf, "manual_trigger_only", true);
+    cJSON_AddBoolToObject(jaf, "supported", af.supported);
+    cJSON_AddBoolToObject(jaf, "initialized", af.initialized);
+    cJSON_AddBoolToObject(jaf, "focused", af.focused);
+    cJSON_AddBoolToObject(jaf, "busy", af.busy);
+    cJSON_AddNumberToObject(jaf, "raw_status", af.raw_status);
+    cJSON_AddNumberToObject(jaf, "sensor_pid", af.sensor_pid);
+    cJSON_AddNumberToObject(jaf, "elapsed_ms", af.elapsed_ms);
+    cJSON_AddStringToObject(jaf, "last_err", esp_err_to_name(af.last_err));
     cJSON *jmem = cJSON_AddObjectToObject(hw, "memory");
     cJSON_AddNumberToObject(jmem, "psram_chip_size", esp_psram_get_size());
     cJSON_AddNumberToObject(jmem, "psram_total", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
@@ -1605,6 +1618,22 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(jmem, "internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     cJSON_AddNumberToObject(jmem, "internal_largest",
                             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    cJSON *jruntime = cJSON_AddObjectToObject(root, "runtime_guard");
+    cJSON_AddBoolToObject(jruntime, "started", runtime.started);
+    cJSON_AddNumberToObject(jruntime, "uptime_seconds", runtime.uptime_seconds);
+    cJSON_AddNumberToObject(jruntime, "check_count", runtime.check_count);
+    cJSON_AddNumberToObject(jruntime, "low_memory_count", runtime.low_memory_count);
+    cJSON_AddNumberToObject(jruntime, "cache_trim_count", runtime.cache_trim_count);
+    cJSON_AddNumberToObject(jruntime, "camera_cleanup_count", runtime.camera_cleanup_count);
+    cJSON_AddNumberToObject(jruntime, "heap_integrity_fail_count",
+                            runtime.heap_integrity_fail_count);
+    cJSON_AddNumberToObject(jruntime, "internal_free", runtime.internal_free);
+    cJSON_AddNumberToObject(jruntime, "internal_min", runtime.internal_min);
+    cJSON_AddNumberToObject(jruntime, "internal_largest", runtime.internal_largest);
+    cJSON_AddNumberToObject(jruntime, "psram_free", runtime.psram_free);
+    cJSON_AddNumberToObject(jruntime, "psram_min", runtime.psram_min);
+    cJSON_AddNumberToObject(jruntime, "psram_largest", runtime.psram_largest);
+    cJSON_AddStringToObject(jruntime, "last_err", esp_err_to_name(runtime.last_err));
     cJSON *ji2c = cJSON_AddObjectToObject(hw, "i2c");
     cJSON_AddStringToObject(ji2c, "touch_backend",
                             BOARD_TOUCH_USE_SOFT_I2C ? "software" : "hardware");
@@ -3339,11 +3368,18 @@ static esp_err_t nfc_restart_post(httpd_req_t *req)
 
 static esp_err_t camera_jpeg_get(httpd_req_t *req)
 {
+    if (camera_mgr_should_keep_online()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "camera is in use by the device preview");
+        return ESP_OK;
+    }
     int64_t start_us = esp_timer_get_time();
     uint8_t *jpg = NULL;
     size_t jpg_len = 0;
     nfc_service_suspend_for_camera();
-    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    if (BOARD_NFC_SHARES_CAMERA_SCCB && BOARD_CAMERA_NFC_QUIET_MS > 0) {
+        vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    }
     esp_err_t err = camera_mgr_capture_jpeg_bytes(&jpg, &jpg_len);
     if (err != ESP_OK || !jpg || jpg_len == 0) {
         if (jpg) {
@@ -3376,6 +3412,11 @@ static esp_err_t camera_jpeg_get(httpd_req_t *req)
 
 static esp_err_t camera_scan_jpeg_get(httpd_req_t *req)
 {
+    if (camera_mgr_should_keep_online()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "camera is in use by the device preview");
+        return ESP_OK;
+    }
     esp_err_t lock_err = ensure_camera_scan_mutex();
     if (lock_err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan mutex alloc failed");
@@ -3389,7 +3430,9 @@ static esp_err_t camera_scan_jpeg_get(httpd_req_t *req)
     int64_t start_us = esp_timer_get_time();
     camera_fb_t *fb = NULL;
     nfc_service_suspend_for_camera();
-    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    if (BOARD_NFC_SHARES_CAMERA_SCCB && BOARD_CAMERA_NFC_QUIET_MS > 0) {
+        vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    }
     esp_err_t err = camera_mgr_capture_scan_jpeg(&fb);
     if (err != ESP_OK || !fb || !fb->buf || fb->len == 0 || fb->format != PIXFORMAT_JPEG) {
         if (fb) {
@@ -3588,7 +3631,9 @@ static esp_err_t camera_capture_upload_to_bridge(const char *upload_path,
     size_t upload_len = 0;
 
     nfc_service_suspend_for_camera();
-    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    if (BOARD_NFC_SHARES_CAMERA_SCCB && BOARD_CAMERA_NFC_QUIET_MS > 0) {
+        vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    }
     bool has_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
     if (has_psram) {
         *capture_err = camera_mgr_capture_jpeg_bytes(&jpg, &jpg_len);
@@ -3628,6 +3673,16 @@ static esp_err_t camera_capture_upload_to_bridge(const char *upload_path,
 
 static esp_err_t camera_upload_post(httpd_req_t *req)
 {
+    if (camera_mgr_should_keep_online()) {
+        cJSON *busy = cJSON_CreateObject();
+        cJSON_AddBoolToObject(busy, "ok", false);
+        cJSON_AddBoolToObject(busy, "camera_in_use", true);
+        cJSON_AddStringToObject(busy, "err", esp_err_to_name(ESP_ERR_INVALID_STATE));
+        cJSON_AddStringToObject(busy, "message", "camera is in use by the device preview");
+        esp_err_t send_err = send_json(req, busy);
+        cJSON_Delete(busy);
+        return send_err;
+    }
     char upload_path[160];
     snprintf(upload_path, sizeof(upload_path), "%s",
              s_cfg && s_cfg->camera_upload_url[0] ? s_cfg->camera_upload_url : "");
@@ -3706,6 +3761,17 @@ static esp_err_t camera_upload_post(httpd_req_t *req)
 
 static esp_err_t camera_scan_post(httpd_req_t *req)
 {
+    if (camera_mgr_should_keep_online()) {
+        cJSON *busy = cJSON_CreateObject();
+        cJSON_AddBoolToObject(busy, "ok", false);
+        cJSON_AddBoolToObject(busy, "camera_in_use", true);
+        cJSON_AddStringToObject(busy, "source", "busy");
+        cJSON_AddStringToObject(busy, "err", esp_err_to_name(ESP_ERR_INVALID_STATE));
+        cJSON_AddStringToObject(busy, "message", "camera is in use by the device preview");
+        esp_err_t send_err = send_json(req, busy);
+        cJSON_Delete(busy);
+        return send_err;
+    }
     esp_err_t lock_err = ensure_camera_scan_mutex();
     if (lock_err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan mutex alloc failed");
@@ -3747,6 +3813,50 @@ static esp_err_t camera_scan_post(httpd_req_t *req)
     esp_err_t send_err = send_json(req, root);
     cJSON_Delete(root);
     xSemaphoreGive(s_camera_scan_mutex);
+    return send_err;
+}
+
+static esp_err_t camera_af_post(httpd_req_t *req)
+{
+    camera_af_result_t af = {
+        .last_err = ESP_ERR_INVALID_STATE,
+    };
+    bool camera_in_use = camera_mgr_should_keep_online();
+    esp_err_t err = camera_in_use ? ESP_ERR_INVALID_STATE : ensure_camera_scan_mutex();
+
+    if (err == ESP_OK &&
+        xSemaphoreTake(s_camera_scan_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        err = ESP_ERR_TIMEOUT;
+        camera_in_use = true;
+    }
+
+    bool locked = err == ESP_OK;
+    if (locked) {
+        nfc_service_suspend_for_camera();
+        if (BOARD_NFC_SHARES_CAMERA_SCCB && BOARD_CAMERA_NFC_QUIET_MS > 0) {
+            vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+        }
+        err = camera_mgr_autofocus(&af);
+        nfc_service_resume_after_camera();
+        xSemaphoreGive(s_camera_scan_mutex);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK && af.focused);
+    cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
+    cJSON_AddBoolToObject(root, "manual_trigger", true);
+    cJSON_AddBoolToObject(root, "camera_in_use", camera_in_use);
+    cJSON_AddBoolToObject(root, "supported", af.supported);
+    cJSON_AddBoolToObject(root, "initialized", af.initialized);
+    cJSON_AddBoolToObject(root, "focused", af.focused);
+    cJSON_AddBoolToObject(root, "busy", af.busy);
+    cJSON_AddNumberToObject(root, "raw_status", af.raw_status);
+    cJSON_AddNumberToObject(root, "sensor_pid", af.sensor_pid);
+    cJSON_AddNumberToObject(root, "elapsed_ms", af.elapsed_ms);
+    ESP_LOGI(TAG, "manual AF request err=%s in_use=%d supported=%d focused=%d",
+             esp_err_to_name(err), camera_in_use, af.supported, af.focused);
+    esp_err_t send_err = send_json(req, root);
+    cJSON_Delete(root);
     return send_err;
 }
 
@@ -3864,6 +3974,7 @@ esp_err_t http_server_start(app_config_t *cfg)
         {.uri = "/api/assets/upload", .method = HTTP_POST, .handler = assets_upload_post},
         {.uri = "/api/assets/delete", .method = HTTP_POST, .handler = assets_delete_post},
         {.uri = "/api/camera/upload", .method = HTTP_POST, .handler = camera_upload_post},
+        {.uri = "/api/camera/af", .method = HTTP_POST, .handler = camera_af_post},
         {.uri = "/api/camera/scan", .method = HTTP_POST, .handler = camera_scan_post},
         {.uri = "/api/camera/scan.jpg", .method = HTTP_GET, .handler = camera_scan_jpeg_get},
         {.uri = "/api/camera.jpg", .method = HTTP_GET, .handler = camera_jpeg_get},

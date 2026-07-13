@@ -16,6 +16,7 @@ idf_component_register(
         "peripheral_arbiter.c"
         "psram_diag.c"
         "qr_scanner.c"
+        "runtime_guard.c"
         "soft_i2c.c"
         "storage_sd.c"
         "touch_ft6336.c"

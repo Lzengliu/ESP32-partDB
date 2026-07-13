@@ -5,7 +5,7 @@
 <p align='center'>Part lookup · Stock operations · QR scanning · NFC tags · Local web management</p>
 
 <p align='center'>
-  <img src='https://img.shields.io/badge/release-V1.1-00b8d9?style=flat-square' alt='V1.1'>
+  <img src='https://img.shields.io/badge/release-V1.11-00b8d9?style=flat-square' alt='V1.11'>
   <img src='https://img.shields.io/badge/ESP--IDF-v5.5.2-e7352c?style=flat-square' alt='ESP-IDF v5.5.2'>
   <img src='https://img.shields.io/badge/target-ESP32--S3-111827?style=flat-square' alt='ESP32-S3'>
   <img src='https://img.shields.io/badge/license-Apache--2.0-22a06b?style=flat-square' alt='Apache-2.0'>
@@ -13,13 +13,13 @@
 
 <p align='center'>
   <a href='README.md'><strong>Chinese Version</strong></a> ·
-  <a href='https://github.com/Lzengliu/ESP32-partDB/releases/tag/v1.1'>V1.1 Release</a> ·
+  <a href='https://github.com/Lzengliu/ESP32-partDB/releases/tag/v1.11'>V1.11 Release</a> ·
   <a href='docs/CHANGES_V1.0_TO_V1.1_EN.md'>V1.0 → V1.1 Changes</a>
 </p>
 
 ESP32-partDB is a standalone hardware terminal that runs on ESP32-S3; it is not the Part-DB server. It is designed for electronics workbenches and component storage areas, combining touch interaction, QR scanning, NFC, stock operations, resource management, and device diagnostics.
 
-- Current stable release: **V1.1**
+- Current stable release: **V1.11**
 - Author: **灵异大队长**
 - Source repository: https://github.com/Lzengliu/ESP32-partDB
 - Part-DB upstream: https://github.com/Part-DB/Part-DB-server
@@ -38,7 +38,7 @@ ESP32-partDB is a standalone hardware terminal that runs on ESP32-S3; it is not 
     <td align='center' valign='top'><img src='docs/demo/terminal-keyboard-search.gif' alt='Keyboard and search results demo' width='480'></td>
   </tr>
   <tr>
-    <td align='center'><strong>Camera QR Scanning</strong><br><sub>Local preview, manual focus, and QR decoding</sub></td>
+    <td align='center'><strong>Camera QR Scanning</strong><br><sub>Local preview, on-demand AF, manual focus, and QR decoding</sub></td>
     <td align='center'><strong>NFC Workflow</strong><br><sub>Background polling, NDEF, and Part-DB routing</sub></td>
   </tr>
   <tr>
@@ -93,15 +93,15 @@ On a fresh device or while WiFi is not configured, the terminal starts its defau
 
 ## Core Capabilities
 
-| Area | V1.1 capabilities |
+| Area | Current source capabilities |
 | --- | --- |
 | Part-DB | URL and API token configuration, fuzzy search, detail lookup, caching, stock updates, and Part/Lot/IPN/barcode routing |
 | Device UI | Home, Search Results, Detail, Shortcuts, Info, Settings, touch keyboard, brightness, and automatic sleep |
-| QR | Local ESP32 decoding with ZXing-C++ first and quirc fallback, SVGA grayscale frames, and conditional retry |
+| QR | Local ESP32 decoding with ZXing-C++ first and quirc fallback, a VGA fast path, conditional SVGA retry, and reusable decode caches |
 | NFC | PN532 background polling, NDEF text read/write/clear, and Part-DB content routing |
 | TF resources | File, background, boot image, lock image, and font resource management |
-| Web and maintenance | Configuration, status, hardware diagnostics, camera preview, scanning, TF management, and OTA |
-| Reliability | 8 MB PSRAM, HTTP concurrency protection, OTA rollback confirmation, failed-upload cleanup, and a persistent device secret |
+| Web and maintenance | Configuration, status, hardware diagnostics, camera preview, manually triggered AF, scanning, TF management, and OTA |
+| Reliability | 8 MB PSRAM, serialized scans, idle resource cleanup, low-memory recovery, heap-integrity checks, OTA rollback confirmation, and a persistent device secret |
 
 See [Feature Details](docs/FEATURES_EN.md) and [Known Issues](docs/KNOWN_ISSUES_EN.md).
 
@@ -111,7 +111,7 @@ See [Feature Details](docs/FEATURES_EN.md) and [Known Issues](docs/KNOWN_ISSUES_
 - ILI9488 SPI display and FT6336 touch controller
 - PN532 NFC module on a dedicated hardware I2C bus
 - SDMMC 1-bit TF card
-- ESP32-S3 camera with manual optical focus
+- OV-series camera; fixed-focus lenses remain manually adjustable, while actuator-equipped OV5640 modules can use the manual AF button
 
 See [firmware/docs/wiring-and-bringup.md](firmware/docs/wiring-and-bringup.md) for detailed wiring.
 
@@ -141,24 +141,21 @@ python -m esptool --chip esp32s3 -b 460800 \
 
 After the V1.1 partition layout is installed, later versions with the same layout can be updated through web OTA.
 
-## Release Files
+## V1.11 Release File
 
 | File | Purpose |
 | --- | --- |
-| `esp32_partdb_terminal_v1.1_merged.bin` | Complete first flash or partition-layout upgrade; write at `0x0` |
-| `esp32_partdb_terminal_v1.1_ota.bin` | Web OTA application image for the same partition layout |
-| `esp32_partdb_terminal_v1.1_firmware.zip` | Bootloader, partition table, OTA data, application, and flashing documentation |
-| `esp32_partdb_terminal_v1.1_source.zip` | Cleaned public source with Chinese and English documentation |
-| `SHA256SUMS` | SHA-256 checksums for release assets |
+| `esp32_partdb_terminal_v1.11_ota.bin` | Web OTA application image for devices that already use the V1.1 partition layout |
 
-See the [V1.1 Release Notes](docs/RELEASE_V1.1_EN.md) for flashing and validation details.
+V1.11 does not include a new merged image because the partition layout is unchanged. See the [V1.11 Release Notes](docs/GITHUB_RELEASE_V1.11.md) for changes and compatibility.
 
 ## Documentation
 
-- [V1.1 Feature Details](docs/FEATURES_EN.md)
-- [V1.1 Known Issues](docs/KNOWN_ISSUES_EN.md)
+- [V1.11 Feature Details](docs/FEATURES_EN.md)
+- [V1.11 Known Issues](docs/KNOWN_ISSUES_EN.md)
+- [V1.11 Release Notes](docs/GITHUB_RELEASE_V1.11.md)
 - [V1.0 → V1.1 Changes](docs/CHANGES_V1.0_TO_V1.1_EN.md)
-- [V1.1 Release and Flashing Guide](docs/RELEASE_V1.1_EN.md)
+- [V1.1 Full Flashing Guide](docs/RELEASE_V1.1_EN.md)
 - [Firmware Project Guide](firmware/README.md)
 - [Third-Party Code and Licenses](docs/THIRD_PARTY_CODE.md)
 

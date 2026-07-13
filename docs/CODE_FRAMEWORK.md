@@ -1,6 +1,6 @@
 # 代码框架说明
 
-版本：V1.1
+版本：V1.11
 
 ## 启动流程
 
@@ -18,6 +18,7 @@ app_main.c
   wifi_portal_start()
   http_server_start()
   device_ui_start()
+  runtime_guard_start()
   confirm_pending_ota()
 ```
 

@@ -397,6 +397,8 @@ typedef enum {
     UI_CAMERA_STOPPED = 0,
     UI_CAMERA_STARTING,
     UI_CAMERA_LIVE,
+    UI_CAMERA_FOCUSING,
+    UI_CAMERA_AF_RESULT,
     UI_CAMERA_CAPTURING,
     UI_CAMERA_RESULT,
     UI_CAMERA_ERROR,
@@ -405,6 +407,7 @@ typedef enum {
 typedef struct {
     volatile ui_camera_mode_t mode;
     volatile bool stop_requested;
+    volatile bool af_requested;
     volatile bool capture_requested;
     volatile bool result_ready;
     esp_err_t last_err;
@@ -413,6 +416,7 @@ typedef struct {
     uint16_t frame_w;
     uint16_t frame_h;
     char message[UI_DETAIL_TEXT_MAX];
+    camera_af_result_t af_result;
     qr_scanner_result_t result;
 } ui_camera_state_t;
 
@@ -3672,9 +3676,47 @@ static void camera_preview_task(void *arg)
 
     camera_mgr_set_keep_online(true);
     nfc_service_suspend_for_camera();
-    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    if (BOARD_NFC_SHARES_CAMERA_SCCB && BOARD_CAMERA_NFC_QUIET_MS > 0) {
+        vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    }
 
     while (!s_camera_ui.stop_requested) {
+        if (s_camera_ui.af_requested) {
+            s_camera_ui.af_requested = false;
+            s_camera_ui.mode = UI_CAMERA_FOCUSING;
+            snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "正在手动 AF 对焦");
+            s_dirty = true;
+
+            memset(&s_camera_ui.af_result, 0, sizeof(s_camera_ui.af_result));
+            esp_err_t err = camera_mgr_autofocus(&s_camera_ui.af_result);
+            s_camera_ui.last_err = err;
+            camera_fb_t *af_frame = NULL;
+            esp_err_t frame_err = s_camera_preview_low_mem ?
+                                  camera_mgr_capture_preview_lowmem(&af_frame) :
+                                  camera_mgr_capture_preview_rgb565(&af_frame);
+            if (frame_err == ESP_OK && af_frame) {
+                copy_camera_preview_frame(af_frame);
+            }
+            if (af_frame) {
+                camera_mgr_release_frame(af_frame);
+            }
+            if (err == ESP_OK && s_camera_ui.af_result.focused) {
+                snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "AF 对焦完成");
+            } else if (err == ESP_ERR_NOT_SUPPORTED) {
+                snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "当前相机不支持 AF");
+            } else if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_NOT_FOUND) {
+                snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "AF 未合焦 %s",
+                         esp_err_to_name(err));
+            } else {
+                snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "AF 对焦失败 %s",
+                         esp_err_to_name(err));
+            }
+            s_camera_ui.mode = UI_CAMERA_AF_RESULT;
+            s_dirty = true;
+            vTaskDelay(pdMS_TO_TICKS(UI_CAMERA_PREVIEW_DELAY_MS));
+            continue;
+        }
+
         if (s_camera_ui.capture_requested) {
             s_camera_ui.capture_requested = false;
             s_camera_ui.mode = UI_CAMERA_CAPTURING;
@@ -3686,24 +3728,9 @@ static void camera_preview_task(void *arg)
             if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
                 release_camera_frame_buffer_keep_mode();
             }
-            esp_err_t err = ESP_ERR_NOT_FOUND;
-            if (s_camera_frame && s_camera_ui.frame_w > 0 && s_camera_ui.frame_h > 0) {
-                snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "识别实时画面");
-                s_dirty = true;
-                err = qr_scanner_decode_rgb565(s_camera_frame, s_camera_ui.frame_w,
-                                               s_camera_ui.frame_h, &s_camera_ui.result);
-                if (!(err == ESP_OK && s_camera_ui.result.found && s_camera_ui.result.text[0])) {
-                    ESP_LOGI(TAG, "live preview QR decode missed: err=%s detail=%s",
-                             esp_err_to_name(err),
-                             s_camera_ui.result.decode_error[0] ?
-                             s_camera_ui.result.decode_error : "-");
-                }
-            }
-            if (!(err == ESP_OK && s_camera_ui.result.found && s_camera_ui.result.text[0])) {
-                snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "识别高清画面");
-                s_dirty = true;
-                err = qr_scanner_scan(&s_camera_ui.result);
-            }
+            snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "识别高清画面");
+            s_dirty = true;
+            esp_err_t err = qr_scanner_scan(&s_camera_ui.result);
             bool found = err == ESP_OK && s_camera_ui.result.found &&
                          s_camera_ui.result.text[0];
             s_camera_ui.result_ready = found;
@@ -3731,7 +3758,8 @@ static void camera_preview_task(void *arg)
             continue;
         }
 
-        if (s_camera_ui.mode == UI_CAMERA_RESULT) {
+        if (s_camera_ui.mode == UI_CAMERA_RESULT ||
+            s_camera_ui.mode == UI_CAMERA_AF_RESULT) {
             vTaskDelay(pdMS_TO_TICKS(UI_CAMERA_PREVIEW_DELAY_MS));
             continue;
         }
@@ -3812,7 +3840,9 @@ static void begin_camera_preview(void)
     }
     if (!s_camera_task) {
         memset(&s_camera_ui.result, 0, sizeof(s_camera_ui.result));
+        memset(&s_camera_ui.af_result, 0, sizeof(s_camera_ui.af_result));
         s_camera_ui.stop_requested = false;
+        s_camera_ui.af_requested = false;
         s_camera_ui.capture_requested = false;
         s_camera_ui.result_ready = false;
         s_camera_ui.mode = UI_CAMERA_STARTING;
@@ -3858,10 +3888,29 @@ static void request_camera_capture(void)
     if (!s_camera_task) {
         return;
     }
-    if (s_camera_ui.mode == UI_CAMERA_LIVE || s_camera_ui.mode == UI_CAMERA_RESULT) {
+    if (s_camera_ui.mode == UI_CAMERA_LIVE || s_camera_ui.mode == UI_CAMERA_RESULT ||
+        s_camera_ui.mode == UI_CAMERA_AF_RESULT) {
         s_camera_ui.capture_requested = true;
         s_camera_ui.mode = UI_CAMERA_CAPTURING;
         snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "正在识别二维码");
+        s_dirty = true;
+    }
+}
+
+static void request_camera_af(void)
+{
+    if (s_camera_ui.mode == UI_CAMERA_ERROR && !s_camera_task) {
+        begin_camera_preview();
+        return;
+    }
+    if (!s_camera_task) {
+        return;
+    }
+    if (s_camera_ui.mode == UI_CAMERA_LIVE || s_camera_ui.mode == UI_CAMERA_RESULT ||
+        s_camera_ui.mode == UI_CAMERA_AF_RESULT) {
+        s_camera_ui.af_requested = true;
+        s_camera_ui.mode = UI_CAMERA_FOCUSING;
+        snprintf(s_camera_ui.message, sizeof(s_camera_ui.message), "正在手动 AF 对焦");
         s_dirty = true;
     }
 }
@@ -4132,6 +4181,7 @@ static uint32_t current_view_hash(void)
     case DEVICE_UI_PAGE_CAMERA:
         hash_u32(&hash, (uint32_t)s_camera_ui.mode);
         hash_bool(&hash, s_camera_task != NULL);
+        hash_bool(&hash, s_camera_ui.af_requested);
         hash_bool(&hash, s_camera_ui.capture_requested);
         hash_bool(&hash, s_camera_ui.result_ready);
         hash_u32(&hash, (uint32_t)s_camera_ui.last_err);
@@ -4144,6 +4194,9 @@ static uint32_t current_view_hash(void)
         hash_bool(&hash, s_camera_ui.result.found);
         hash_string(&hash, s_camera_ui.result.text);
         hash_string(&hash, s_camera_ui.result.decode_error);
+        hash_bool(&hash, s_camera_ui.af_result.supported);
+        hash_bool(&hash, s_camera_ui.af_result.focused);
+        hash_u32(&hash, (uint32_t)s_camera_ui.af_result.last_err);
         break;
     case DEVICE_UI_PAGE_HOME:
     default: {
@@ -5463,18 +5516,15 @@ static void draw_system(void)
     draw_tile(x2, 284, tile_w, 74, "硬件诊断", line1, line2, diag.finished ? UI_GREEN : UI_YELLOW);
 }
 
-static void draw_camera_action_button(int y, const char *value, uint16_t accent)
+static void draw_camera_action_button(int x, int y, int width,
+                                      const char *value, uint16_t accent)
 {
-    int w = display_ili9488_get_width();
-    int x = 12;
-    int cw = w - 24;
     int ch = UI_CAMERA_BUTTON_H;
-    (void)display_ili9488_fill_rect(x, y, cw, ch, UI_PANEL);
-    (void)display_ili9488_fill_rect(x, y, cw, 1, accent);
-    (void)display_ili9488_fill_rect(x, y + ch - 1, cw, 1, UI_BG);
+    (void)display_ili9488_fill_rect(x, y, width, ch, UI_PANEL);
+    (void)display_ili9488_fill_rect(x, y, width, 1, accent);
+    (void)display_ili9488_fill_rect(x, y + ch - 1, width, 1, UI_BG);
     (void)display_ili9488_fill_rect(x, y, 5, ch, accent);
-    draw_text_patch(x + 15, y + 7, 48, 24, "相机", UI_MUTED, UI_PANEL);
-    draw_text_patch(x + 72, y + 7, cw - 84, 24, value, UI_TEXT, UI_PANEL);
+    draw_text_patch(x + 15, y + 7, width - 24, 24, value, UI_TEXT, UI_PANEL);
 }
 
 static void draw_camera_status_line(int y, const char *text, uint16_t color)
@@ -5555,7 +5605,9 @@ static void draw_camera(void)
     }
 
     const char *button = "扫码";
+    const char *af_button = "AF 对焦";
     uint16_t accent = UI_CYAN;
+    uint16_t af_accent = UI_BLUE;
     uint16_t status_color = UI_MUTED;
     if (s_camera_ui.mode == UI_CAMERA_STARTING) {
         button = "启动中";
@@ -5563,9 +5615,19 @@ static void draw_camera(void)
     } else if (s_camera_ui.mode == UI_CAMERA_CAPTURING) {
         button = "识别中";
         accent = UI_YELLOW;
+    } else if (s_camera_ui.mode == UI_CAMERA_FOCUSING) {
+        af_button = "AF 对焦中";
+        af_accent = UI_YELLOW;
+        status_color = UI_YELLOW;
+    } else if (s_camera_ui.mode == UI_CAMERA_AF_RESULT) {
+        af_button = "再次 AF";
+        af_accent = s_camera_ui.af_result.focused ? UI_GREEN : UI_YELLOW;
+        status_color = s_camera_ui.af_result.focused ? UI_GREEN : UI_YELLOW;
     } else if (s_camera_ui.mode == UI_CAMERA_ERROR) {
         button = "重试";
+        af_button = "重试";
         accent = UI_RED;
+        af_accent = UI_RED;
         status_color = UI_RED;
     } else if (s_camera_ui.mode == UI_CAMERA_RESULT) {
         button = "再次扫码";
@@ -5575,7 +5637,10 @@ static void draw_camera(void)
     int by = camera_button_y();
     draw_camera_status_line(by - 22, s_camera_ui.message[0] ? s_camera_ui.message : "点击扫码",
                             status_color);
-    draw_camera_action_button(by, button, accent);
+    int gap = 8;
+    int button_w = (w - 24 - gap) / 2;
+    draw_camera_action_button(12, by, button_w, af_button, af_accent);
+    draw_camera_action_button(12 + button_w + gap, by, button_w, button, accent);
 }
 
 static void draw_key(int x, int y, int w, int h, const char *label, bool accent)
@@ -6689,7 +6754,14 @@ static bool handle_ui_tap(uint16_t x, uint16_t y)
 
     if (s_status.page == DEVICE_UI_PAGE_CAMERA) {
         int by = camera_button_y();
-        if (point_in(x, y, 12, by, w - 24, UI_CAMERA_BUTTON_H)) {
+        int gap = 8;
+        int button_w = (w - 24 - gap) / 2;
+        if (point_in(x, y, 12, by, button_w, UI_CAMERA_BUTTON_H)) {
+            request_camera_af();
+            return true;
+        }
+        if (point_in(x, y, 12 + button_w + gap, by,
+                     button_w, UI_CAMERA_BUTTON_H)) {
             request_camera_capture();
             return true;
         }

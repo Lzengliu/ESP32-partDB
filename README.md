@@ -5,7 +5,7 @@
 <p align='center'>元器件查询 · 库存操作 · 二维码扫描 · NFC 标签 · 本地 Web 管理</p>
 
 <p align='center'>
-  <img src='https://img.shields.io/badge/release-V1.1-00b8d9?style=flat-square' alt='V1.1'>
+  <img src='https://img.shields.io/badge/release-V1.11-00b8d9?style=flat-square' alt='V1.11'>
   <img src='https://img.shields.io/badge/ESP--IDF-v5.5.2-e7352c?style=flat-square' alt='ESP-IDF v5.5.2'>
   <img src='https://img.shields.io/badge/target-ESP32--S3-111827?style=flat-square' alt='ESP32-S3'>
   <img src='https://img.shields.io/badge/license-Apache--2.0-22a06b?style=flat-square' alt='Apache-2.0'>
@@ -13,13 +13,13 @@
 
 <p align='center'>
   <a href='README_EN.md'><strong>English Version</strong></a> ·
-  <a href='https://github.com/Lzengliu/ESP32-partDB/releases/tag/v1.1'>V1.1 Release</a> ·
+  <a href='https://github.com/Lzengliu/ESP32-partDB/releases/tag/v1.11'>V1.11 Release</a> ·
   <a href='docs/CHANGES_V1.0_TO_V1.1.md'>V1.0 → V1.1 变更</a>
 </p>
 
 ESP32-partDB 是运行在 ESP32-S3 上的独立硬件终端，不是 Part-DB 服务端。它面向工作台和元器件仓库现场，提供触摸操作、扫码、NFC、库存读写、资源管理和设备诊断。
 
-- 当前稳定版本：**V1.1**
+- 当前稳定版本：**V1.11**
 - 作者：**灵异大队长**
 - 开源地址：https://github.com/Lzengliu/ESP32-partDB
 - Part-DB 上游：https://github.com/Part-DB/Part-DB-server
@@ -38,7 +38,7 @@ ESP32-partDB 是运行在 ESP32-S3 上的独立硬件终端，不是 Part-DB 服
     <td align='center' valign='top'><img src='docs/demo/terminal-keyboard-search.gif' alt='键盘和搜索区域功能演示' width='480'></td>
   </tr>
   <tr>
-    <td align='center'><strong>摄像头二维码扫描</strong><br><sub>本地预览、手动调焦与二维码识别</sub></td>
+    <td align='center'><strong>摄像头二维码扫描</strong><br><sub>本地预览、按键 AF、手动调焦与二维码识别</sub></td>
     <td align='center'><strong>NFC 工作流</strong><br><sub>后台读卡、NDEF 与 Part-DB 对象路由</sub></td>
   </tr>
   <tr>
@@ -93,15 +93,15 @@ ESP32-partDB 是运行在 ESP32-S3 上的独立硬件终端，不是 Part-DB 服
 
 ## 核心能力
 
-| 模块 | V1.1 能力 |
+| 模块 | 当前源码能力 |
 | --- | --- |
 | Part-DB | 地址和 API Token 配置、模糊搜索、详情读取、缓存、库存写回、Part/Lot/IPN/条码路由 |
 | 设备 UI | 主页、搜索结果、详情、快捷操作、信息、设置、软键盘、亮度和自动息屏 |
-| 二维码 | ESP32 本地解码，ZXing-C++ 优先、quirc 回退；SVGA 灰度帧与条件式重试 |
+| 二维码 | ESP32 本地解码，ZXing-C++ 优先、quirc 回退；VGA 快速路径、条件式 SVGA 重试与解码缓存复用 |
 | NFC | PN532 后台读卡、NDEF 文本读取/写入/清除、Part-DB 内容路由 |
 | TF 资源 | 文件、背景图、开机图、锁屏图和字体资源管理 |
-| Web 与维护 | 配置、状态、硬件诊断、相机预览、扫码、TF 管理和 OTA |
-| 稳定性 | 8 MB PSRAM、HTTP 并发保护、OTA 回滚确认、上传失败清理和持久化设备密钥 |
+| Web 与维护 | 配置、状态、硬件诊断、相机预览、仅手动触发 AF、扫码、TF 管理和 OTA |
+| 稳定性 | 8 MB PSRAM、扫码互斥、闲置资源回收、低内存恢复、堆完整性检查、OTA 回滚确认和持久化设备密钥 |
 
 完整说明见 [功能详情](docs/FEATURES.md) 和 [已知问题](docs/KNOWN_ISSUES.md)。
 
@@ -111,7 +111,7 @@ ESP32-partDB 是运行在 ESP32-S3 上的独立硬件终端，不是 Part-DB 服
 - ILI9488 SPI 显示屏与 FT6336 触摸控制器
 - PN532 NFC 模块，独立硬件 I2C
 - SDMMC 1-bit TF 卡
-- ESP32-S3 摄像头，手动光学调焦
+- OV 系列摄像头；固定焦镜头可手动调焦，带执行器的 OV5640 可使用手动 AF 按钮
 
 详细接线见 [firmware/docs/wiring-and-bringup.md](firmware/docs/wiring-and-bringup.md)。
 
@@ -141,24 +141,21 @@ python -m esptool --chip esp32s3 -b 460800 \
 
 安装过 V1.1 分区表后，后续相同布局版本可通过 Web OTA 更新。
 
-## 发布文件
+## V1.11 发布文件
 
 | 文件 | 用途 |
 | --- | --- |
-| `esp32_partdb_terminal_v1.1_merged.bin` | 完整首次刷写或跨分区版本升级，写入 `0x0` |
-| `esp32_partdb_terminal_v1.1_ota.bin` | 相同分区布局下的 Web OTA 应用镜像 |
-| `esp32_partdb_terminal_v1.1_firmware.zip` | bootloader、分区表、OTA 数据、应用和刷写说明 |
-| `esp32_partdb_terminal_v1.1_source.zip` | 清理后的公开源码与中英文文档 |
-| `SHA256SUMS` | Release 附件 SHA-256 校验和 |
+| `esp32_partdb_terminal_v1.11_ota.bin` | 已安装 V1.1 分区表设备的 Web OTA 应用镜像 |
 
-刷写和验证细节见 [V1.1 发布说明](docs/RELEASE_V1.1.md)。
+V1.11 不提供新的 merged 镜像，因为分区布局没有变化。更新内容和兼容性见 [V1.11 发布说明](docs/GITHUB_RELEASE_V1.11.md)。
 
 ## 文档导航
 
-- [V1.1 功能详情](docs/FEATURES.md)
-- [V1.1 已知问题](docs/KNOWN_ISSUES.md)
+- [V1.11 功能详情](docs/FEATURES.md)
+- [V1.11 已知问题](docs/KNOWN_ISSUES.md)
+- [V1.11 发布说明](docs/GITHUB_RELEASE_V1.11.md)
 - [V1.0 → V1.1 变更对比](docs/CHANGES_V1.0_TO_V1.1.md)
-- [V1.1 发布与刷写说明](docs/RELEASE_V1.1.md)
+- [V1.1 完整刷写说明](docs/RELEASE_V1.1.md)
 - [固件工程说明](firmware/README.md)
 - [第三方代码与许可证](docs/THIRD_PARTY_CODE.md)
 

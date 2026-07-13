@@ -14,12 +14,23 @@
 #include "quirc.h"
 #include "zxing_qr_decoder.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "qr_scanner";
 static qr_scanner_status_t s_status = {
     .last_err = ESP_ERR_INVALID_STATE,
 };
+static SemaphoreHandle_t s_scan_mutex;
+static portMUX_TYPE s_scan_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t *s_luma_cache;
+static size_t s_luma_cache_size;
+static struct quirc *s_quirc;
+static struct quirc_code *s_quirc_code;
+static struct quirc_data *s_quirc_data;
+static int s_quirc_width;
+static int s_quirc_height;
+static int64_t s_last_use_us;
 
 #define QR_SCANNER_MAX_ATTEMPTS 2
 #define QR_SCANNER_RETRY_DELAY_MS 120
@@ -27,6 +38,8 @@ static qr_scanner_status_t s_status = {
 #define QR_SCANNER_SAVE_DEBUG_PGM 0
 #define QR_SCANNER_FAST_PIPELINE 1
 #define QR_SCANNER_FAST_STRETCH_FALLBACK 0
+#define QR_SCANNER_CACHE_IDLE_MS 60000
+#define QR_SCANNER_LOCK_TIMEOUT_MS 15000
 
 static void copy_payload(char *dst, size_t dst_len, const uint8_t *src, size_t src_len)
 {
@@ -92,6 +105,56 @@ static void *scanner_malloc(size_t size)
     return p;
 }
 
+static esp_err_t scanner_lock(uint32_t timeout_ms)
+{
+    if (!s_scan_mutex) {
+        SemaphoreHandle_t created = xSemaphoreCreateMutex();
+        if (!created) {
+            return ESP_ERR_NO_MEM;
+        }
+        portENTER_CRITICAL(&s_scan_mutex_init_lock);
+        if (!s_scan_mutex) {
+            s_scan_mutex = created;
+            created = NULL;
+        }
+        portEXIT_CRITICAL(&s_scan_mutex_init_lock);
+        if (created) {
+            vSemaphoreDelete(created);
+        }
+    }
+    return xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE ?
+           ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void scanner_unlock(void)
+{
+    if (s_scan_mutex) {
+        xSemaphoreGive(s_scan_mutex);
+    }
+}
+
+static uint8_t *scanner_luma_buffer(size_t size)
+{
+    if (s_luma_cache && s_luma_cache_size >= size) {
+        return s_luma_cache;
+    }
+    if (s_luma_cache) {
+        heap_caps_free(s_luma_cache);
+        s_luma_cache = NULL;
+        s_luma_cache_size = 0;
+    }
+    s_luma_cache = scanner_malloc(size);
+    if (s_luma_cache) {
+        s_luma_cache_size = size;
+    }
+    return s_luma_cache;
+}
+
+static void scanner_release_luma(uint8_t *buffer)
+{
+    (void)buffer;
+}
+
 static void scanner_yield(void)
 {
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -150,6 +213,7 @@ static void save_debug_pgm(const uint8_t *luma, uint16_t width, uint16_t height,
 #endif
 }
 
+#if !QR_SCANNER_FAST_PIPELINE || QR_SCANNER_FAST_STRETCH_FALLBACK
 static uint8_t histogram_percentile(const uint32_t hist[256], uint32_t pixels, uint32_t percent)
 {
     if (!hist || pixels == 0) {
@@ -171,6 +235,7 @@ static uint8_t histogram_percentile(const uint32_t hist[256], uint32_t pixels, u
     }
     return 255;
 }
+#endif
 
 #if !QR_SCANNER_FAST_PIPELINE || QR_SCANNER_FAST_STRETCH_FALLBACK
 static bool build_contrast_stretch(const uint8_t *src, uint8_t *dst, size_t count,
@@ -195,6 +260,7 @@ static bool build_contrast_stretch(const uint8_t *src, uint8_t *dst, size_t coun
 }
 #endif
 
+#if !QR_SCANNER_FAST_PIPELINE
 static uint8_t otsu_threshold(const uint32_t hist[256], uint32_t pixels)
 {
     if (!hist || pixels == 0) {
@@ -233,6 +299,7 @@ static uint8_t otsu_threshold(const uint32_t hist[256], uint32_t pixels)
 
     return threshold;
 }
+#endif
 
 #if !QR_SCANNER_FAST_PIPELINE
 static void build_binary_threshold(const uint8_t *src, uint8_t *dst, size_t count,
@@ -311,9 +378,12 @@ static esp_err_t quirc_decode_attempt(const char *label, const uint8_t *luma,
     }
 
     int64_t start_us = esp_timer_get_time();
-    struct quirc *qr = quirc_new();
-    struct quirc_code *code = NULL;
-    struct quirc_data *data = NULL;
+    if (!s_quirc) {
+        s_quirc = quirc_new();
+    }
+    struct quirc *qr = s_quirc;
+    struct quirc_code *code = s_quirc_code;
+    struct quirc_data *data = s_quirc_data;
     esp_err_t err = ESP_ERR_NOT_FOUND;
     const char *last_error = "no_qr";
 
@@ -322,10 +392,14 @@ static esp_err_t quirc_decode_attempt(const char *label, const uint8_t *luma,
         last_error = "quirc_new";
         goto done;
     }
-    if (quirc_resize(qr, q_w, q_h) < 0) {
-        err = ESP_ERR_NO_MEM;
-        last_error = "quirc_resize";
-        goto done;
+    if (s_quirc_width != q_w || s_quirc_height != q_h) {
+        if (quirc_resize(qr, q_w, q_h) < 0) {
+            err = ESP_ERR_NO_MEM;
+            last_error = "quirc_resize";
+            goto done;
+        }
+        s_quirc_width = q_w;
+        s_quirc_height = q_h;
     }
 
     int img_w = 0;
@@ -359,8 +433,14 @@ static esp_err_t quirc_decode_attempt(const char *label, const uint8_t *luma,
         goto done;
     }
 
-    code = scanner_malloc(sizeof(*code));
-    data = scanner_malloc(sizeof(*data));
+    if (!code) {
+        code = scanner_malloc(sizeof(*code));
+        s_quirc_code = code;
+    }
+    if (!data) {
+        data = scanner_malloc(sizeof(*data));
+        s_quirc_data = data;
+    }
     if (!code || !data) {
         err = ESP_ERR_NO_MEM;
         last_error = "quirc_decode_alloc";
@@ -397,15 +477,6 @@ done:
              q_w, q_h, (long long)((esp_timer_get_time() - start_us) / 1000),
              result->decode_error[0] ? result->decode_error : "-");
     scanner_yield();
-    if (code) {
-        heap_caps_free(code);
-    }
-    if (data) {
-        heap_caps_free(data);
-    }
-    if (qr) {
-        quirc_destroy(qr);
-    }
     return err;
 }
 #endif
@@ -540,8 +611,42 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
     uint8_t max_luma = 0;
     uint64_t sum_luma = 0;
     uint32_t pixels_count = (uint32_t)width * (uint32_t)height;
+    bool direct_luma = luma_reader == grayscale_luma_reader;
+
+#if QR_SCANNER_FAST_PIPELINE && !QR_SCANNER_FAST_STRETCH_FALLBACK
+    luma_buf = direct_luma ? (uint8_t *)pixels : scanner_luma_buffer((size_t)pixels_count);
+    if (!luma_buf) {
+        result->err = ESP_ERR_NO_MEM;
+        snprintf(result->decode_error, sizeof(result->decode_error), "luma_alloc");
+        goto done_no_qr;
+    }
+    uint32_t stats_count = 0;
+    uint32_t stats_step = direct_luma && pixels_count > 32768 ? 4 : 1;
+    if (direct_luma) {
+        for (uint32_t i = 0; i < pixels_count; i += stats_step) {
+            uint8_t luma = luma_buf[i];
+            if (luma < min_luma) min_luma = luma;
+            if (luma > max_luma) max_luma = luma;
+            sum_luma += luma;
+            stats_count++;
+        }
+    } else {
+        for (uint32_t i = 0; i < pixels_count; i++) {
+            uint8_t luma = luma_reader(pixels, i);
+            luma_buf[i] = luma;
+            if (luma < min_luma) min_luma = luma;
+            if (luma > max_luma) max_luma = luma;
+            sum_luma += luma;
+        }
+        stats_count = pixels_count;
+    }
+    ESP_LOGI(TAG, "luma stats min=%u max=%u mean=%u zero_copy=%d",
+             min_luma, max_luma,
+             stats_count ? (unsigned)(sum_luma / stats_count) : 0,
+             direct_luma);
+#else
     uint32_t hist[256] = {0};
-    luma_buf = scanner_malloc((size_t)pixels_count);
+    luma_buf = direct_luma ? (uint8_t *)pixels : scanner_luma_buffer((size_t)pixels_count);
     if (!luma_buf) {
         result->err = ESP_ERR_NO_MEM;
         snprintf(result->decode_error, sizeof(result->decode_error), "luma_alloc");
@@ -550,8 +655,11 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
     for (uint16_t y = 0; y < height; y++) {
         for (uint16_t x = 0; x < width; x++) {
             size_t src_index = (size_t)y * width + x;
-            uint8_t luma = luma_reader(pixels, src_index);
-            luma_buf[src_index] = luma;
+            uint8_t luma = direct_luma ? luma_buf[src_index] :
+                           luma_reader(pixels, src_index);
+            if (!direct_luma) {
+                luma_buf[src_index] = luma;
+            }
             if (luma < min_luma) {
                 min_luma = luma;
             }
@@ -571,6 +679,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
              min_luma, max_luma,
              pixels_count ? (unsigned)(sum_luma / pixels_count) : 0,
              p02, p98, p05, p95, (unsigned)(p95 - p05), otsu);
+#endif
     save_debug_pgm(luma_buf, width, height, width);
 
 #if QR_SCANNER_FAST_PIPELINE
@@ -583,7 +692,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
     esp_err_t zxing_err = zxing_decode_attempt("fast", luma_buf, width, height, width,
                                                result, &zxing, false);
     if (result->found) {
-        heap_caps_free(luma_buf);
+        scanner_release_luma(luma_buf);
         return finish_result(result, start_us, remember);
     }
     last_err = zxing_err == ESP_OK ? ESP_ERR_NOT_FOUND : zxing_err;
@@ -594,7 +703,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
     esp_err_t quirc_err = quirc_decode_attempt("fast", luma_buf, width, height, width,
                                                result, false);
     if (result->found) {
-        heap_caps_free(luma_buf);
+        scanner_release_luma(luma_buf);
         return finish_result(result, start_us, remember);
     }
     quirc_saw_code = result->code_count > 0;
@@ -614,7 +723,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                              result, &zxing, false);
             if (result->found) {
                 heap_caps_free(work_buf);
-                heap_caps_free(luma_buf);
+                scanner_release_luma(luma_buf);
                 return finish_result(result, start_us, remember);
             }
             if (zxing_err != ESP_ERR_NOT_FOUND || !last_error[0]) {
@@ -633,14 +742,14 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
     snprintf(result->decode_error, sizeof(result->decode_error), "%.*s",
              (int)sizeof(result->decode_error) - 1,
              last_error[0] ? last_error : "no_qr");
-    heap_caps_free(luma_buf);
+    scanner_release_luma(luma_buf);
     return finish_result(result, start_us, remember);
 #else
     zxing_qr_result_t zxing = {0};
     esp_err_t zxing_err = zxing_decode_attempt("full", luma_buf, width, height, width,
                                                result, &zxing, true);
     if (result->found) {
-        heap_caps_free(luma_buf);
+        scanner_release_luma(luma_buf);
         return finish_result(result, start_us, remember);
     }
 
@@ -655,7 +764,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                              result, &zxing, true);
             if (result->found) {
                 heap_caps_free(work_buf);
-                heap_caps_free(luma_buf);
+                scanner_release_luma(luma_buf);
                 return finish_result(result, start_us, remember);
             }
             if (zxing_err != ESP_ERR_NOT_FOUND || !last_error[0]) {
@@ -670,7 +779,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                          result, &zxing, true);
         if (result->found) {
             heap_caps_free(work_buf);
-            heap_caps_free(luma_buf);
+            scanner_release_luma(luma_buf);
             return finish_result(result, start_us, remember);
         }
         if (zxing_err != ESP_ERR_NOT_FOUND || !last_error[0]) {
@@ -691,7 +800,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
         if (work_buf) {
             heap_caps_free(work_buf);
         }
-        heap_caps_free(luma_buf);
+        scanner_release_luma(luma_buf);
         return finish_result(result, start_us, remember);
     }
     if (quirc_err != ESP_ERR_NOT_FOUND || result->code_count > 0) {
@@ -705,7 +814,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
         if (work_buf) {
             heap_caps_free(work_buf);
         }
-        heap_caps_free(luma_buf);
+        scanner_release_luma(luma_buf);
         return finish_result(result, start_us, remember);
     }
     if (quirc_err != ESP_ERR_NOT_FOUND || result->code_count > 0) {
@@ -718,7 +827,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                          result, false);
         if (result->found) {
             heap_caps_free(work_buf);
-            heap_caps_free(luma_buf);
+            scanner_release_luma(luma_buf);
             return finish_result(result, start_us, remember);
         }
         if (quirc_err != ESP_ERR_NOT_FOUND || result->code_count > 0) {
@@ -731,7 +840,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                          result, true);
         if (result->found) {
             heap_caps_free(work_buf);
-            heap_caps_free(luma_buf);
+            scanner_release_luma(luma_buf);
             return finish_result(result, start_us, remember);
         }
         if (quirc_err != ESP_ERR_NOT_FOUND || result->code_count > 0) {
@@ -745,7 +854,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                          result, &zxing, true);
         if (result->found) {
             heap_caps_free(work_buf);
-            heap_caps_free(luma_buf);
+            scanner_release_luma(luma_buf);
             return finish_result(result, start_us, remember);
         }
         if (zxing_err != ESP_ERR_NOT_FOUND || !last_error[0]) {
@@ -758,7 +867,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                          result, false);
         if (result->found) {
             heap_caps_free(work_buf);
-            heap_caps_free(luma_buf);
+            scanner_release_luma(luma_buf);
             return finish_result(result, start_us, remember);
         }
         if (quirc_err != ESP_ERR_NOT_FOUND || result->code_count > 0) {
@@ -771,7 +880,7 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
                                          result, true);
         if (result->found) {
             heap_caps_free(work_buf);
-            heap_caps_free(luma_buf);
+            scanner_release_luma(luma_buf);
             return finish_result(result, start_us, remember);
         }
         if (quirc_err != ESP_ERR_NOT_FOUND || result->code_count > 0) {
@@ -789,13 +898,13 @@ static esp_err_t decode_luma_internal(const void *pixels, uint16_t width,
     if (work_buf) {
         heap_caps_free(work_buf);
     }
-    heap_caps_free(luma_buf);
+    scanner_release_luma(luma_buf);
     return finish_result(result, start_us, remember);
 #endif
 
 done_no_qr:
     if (luma_buf) {
-        heap_caps_free(luma_buf);
+        scanner_release_luma(luma_buf);
     }
     return finish_result(result, start_us, remember);
 }
@@ -941,12 +1050,23 @@ esp_err_t qr_scanner_scan(qr_scanner_result_t *result)
         return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t lock_err = scanner_lock(QR_SCANNER_LOCK_TIMEOUT_MS);
+    if (lock_err != ESP_OK) {
+        memset(result, 0, sizeof(*result));
+        result->err = lock_err;
+        snprintf(result->decode_error, sizeof(result->decode_error), "scanner_busy");
+        return lock_err;
+    }
+
     int64_t start_us = esp_timer_get_time();
+    s_last_use_us = start_us;
     camera_fb_t *fb = NULL;
     esp_err_t err = ESP_OK;
 
     nfc_service_suspend_for_camera();
-    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    if (BOARD_NFC_SHARES_CAMERA_SCCB && BOARD_CAMERA_NFC_QUIET_MS > 0) {
+        vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    }
 
     memset(result, 0, sizeof(*result));
     result->err = ESP_ERR_NOT_FOUND;
@@ -955,7 +1075,8 @@ esp_err_t qr_scanner_scan(qr_scanner_result_t *result)
 
     for (int attempt = 0; attempt < QR_SCANNER_MAX_ATTEMPTS; attempt++) {
         fb = NULL;
-        err = camera_mgr_capture_scan_grayscale(&fb);
+        err = attempt == 0 ? camera_mgr_capture_scan_grayscale_fast(&fb) :
+              camera_mgr_capture_scan_grayscale(&fb);
         if (err != ESP_OK || !fb) {
             ESP_LOGW(TAG, "grayscale scan capture failed, falling back to jpeg: %s",
                      esp_err_to_name(err));
@@ -996,27 +1117,90 @@ esp_err_t qr_scanner_scan(qr_scanner_result_t *result)
         }
     }
 
-    if (!camera_mgr_should_keep_online()) {
+    if (BOARD_NFC_SHARES_CAMERA_SCCB && !camera_mgr_should_keep_online()) {
         camera_mgr_deinit();
     }
     nfc_service_resume_after_camera();
     remember_result(result);
+    s_last_use_us = esp_timer_get_time();
+    scanner_unlock();
     return err;
 }
 
 esp_err_t qr_scanner_decode_rgb565(const uint16_t *rgb565, uint16_t width, uint16_t height,
                                    qr_scanner_result_t *result)
 {
-    return decode_rgb565_internal(rgb565, width, height, result, esp_timer_get_time(), true);
+    esp_err_t lock_err = scanner_lock(QR_SCANNER_LOCK_TIMEOUT_MS);
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    s_last_use_us = esp_timer_get_time();
+    esp_err_t err = decode_rgb565_internal(rgb565, width, height, result,
+                                           s_last_use_us, true);
+    s_last_use_us = esp_timer_get_time();
+    scanner_unlock();
+    return err;
 }
 
 esp_err_t qr_scanner_decode_grayscale(const uint8_t *gray, uint16_t width, uint16_t height,
                                       qr_scanner_result_t *result)
 {
-    return decode_grayscale_internal(gray, width, height, result, esp_timer_get_time(), true);
+    esp_err_t lock_err = scanner_lock(QR_SCANNER_LOCK_TIMEOUT_MS);
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    s_last_use_us = esp_timer_get_time();
+    esp_err_t err = decode_grayscale_internal(gray, width, height, result,
+                                              s_last_use_us, true);
+    s_last_use_us = esp_timer_get_time();
+    scanner_unlock();
+    return err;
 }
 
 qr_scanner_status_t qr_scanner_get_status(void)
 {
     return s_status;
+}
+
+bool qr_scanner_trim_cache(bool force)
+{
+    if (scanner_lock(50) != ESP_OK) {
+        return false;
+    }
+    int64_t now_us = esp_timer_get_time();
+    int64_t idle_ms = s_last_use_us > 0 ? (now_us - s_last_use_us) / 1000 : INT64_MAX;
+    if (!force && idle_ms < QR_SCANNER_CACHE_IDLE_MS) {
+        scanner_unlock();
+        return false;
+    }
+
+    bool released = false;
+    if (s_luma_cache) {
+        heap_caps_free(s_luma_cache);
+        s_luma_cache = NULL;
+        s_luma_cache_size = 0;
+        released = true;
+    }
+    if (s_quirc_code) {
+        heap_caps_free(s_quirc_code);
+        s_quirc_code = NULL;
+        released = true;
+    }
+    if (s_quirc_data) {
+        heap_caps_free(s_quirc_data);
+        s_quirc_data = NULL;
+        released = true;
+    }
+    if (s_quirc) {
+        quirc_destroy(s_quirc);
+        s_quirc = NULL;
+        s_quirc_width = 0;
+        s_quirc_height = 0;
+        released = true;
+    }
+    if (released) {
+        ESP_LOGI(TAG, "released idle QR decode cache after %lld ms", (long long)idle_ms);
+    }
+    scanner_unlock();
+    return released;
 }

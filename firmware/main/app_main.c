@@ -25,6 +25,7 @@
 #include "partdb_client.h"
 #include "peripheral_arbiter.h"
 #include "psram_diag.h"
+#include "runtime_guard.h"
 #include "storage_sd.h"
 #include "touch_ft6336.h"
 #include "ui_font.h"
@@ -444,6 +445,11 @@ void app_main(void)
         ESP_LOGW(TAG, "Device UI not started: %s", esp_err_to_name(err));
     } else {
         ESP_LOGI(TAG, "Device UI started");
+    }
+    err = runtime_guard_start();
+    if (err != ESP_OK) {
+        boot_healthy = false;
+        ESP_LOGE(TAG, "Runtime maintenance not started: %s", esp_err_to_name(err));
     }
     confirm_pending_ota(boot_healthy);
     ESP_LOGI(TAG, "Boot complete");

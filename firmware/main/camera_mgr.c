@@ -7,6 +7,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_check.h"
+#include "esp_camera_af.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -25,7 +26,12 @@ static pixformat_t s_pixel_format = PIXFORMAT_JPEG;
 static framesize_t s_frame_size = FRAMESIZE_INVALID;
 static SemaphoreHandle_t s_mutex;
 static int64_t s_last_deinit_us;
+static int64_t s_last_activity_us;
 static bool s_runtime_keep_online;
+static bool s_af_initialized;
+static camera_af_result_t s_af_status = {
+    .last_err = ESP_ERR_INVALID_STATE,
+};
 
 #define CAMERA_WEB_FRAME_SIZE FRAMESIZE_QVGA
 #define CAMERA_WEB_LOW_MEM_FRAME_SIZE FRAMESIZE_QQVGA
@@ -34,6 +40,7 @@ static bool s_runtime_keep_online;
 #define CAMERA_PREVIEW_LOW_MEM_FRAME_SIZE FRAMESIZE_QCIF
 #define CAMERA_RGB565_LOW_MEM_FRAME_SIZE FRAMESIZE_QQVGA
 #define CAMERA_SCAN_FRAME_SIZE FRAMESIZE_SVGA
+#define CAMERA_SCAN_FAST_FRAME_SIZE FRAMESIZE_VGA
 #define CAMERA_SCAN_JPEG_FRAME_SIZE FRAMESIZE_VGA
 #define CAMERA_SCAN_RGB_FRAME_SIZE FRAMESIZE_VGA
 #define CAMERA_SCAN_LOW_MEM_FRAME_SIZE FRAMESIZE_QCIF
@@ -42,6 +49,13 @@ static bool s_runtime_keep_online;
 #define CAMERA_RGB_TO_JPEG_QUALITY 55
 #define CAMERA_REINIT_GUARD_MS 500
 #define CAMERA_POST_INIT_SETTLE_MS 80
+
+static void camera_note_deinit_locked(void)
+{
+    s_af_initialized = false;
+    s_af_status.initialized = false;
+    s_af_status.busy = false;
+}
 
 static void camera_apply_sensor_profile(sensor_t *sensor, pixformat_t pixel_format,
                                         framesize_t frame_size)
@@ -227,8 +241,12 @@ static void camera_wait_after_deinit_locked(void)
     vTaskDelay(pdMS_TO_TICKS(wait_ms));
 }
 
-static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame_size)
+static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame_size,
+                                     bool *reused)
 {
+    if (reused) {
+        *reused = false;
+    }
     ESP_RETURN_ON_ERROR(ensure_mutex(), TAG, "mutex init failed");
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -256,6 +274,10 @@ static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame
 
     if (s_active) {
         if (s_pixel_format == pixel_format && s_frame_size == effective_frame_size) {
+            if (reused) {
+                *reused = true;
+            }
+            s_last_activity_us = esp_timer_get_time();
             xSemaphoreGive(s_mutex);
             return ESP_OK;
         }
@@ -269,6 +291,7 @@ static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame
         s_last_deinit_us = esp_timer_get_time();
         s_active = false;
         s_frame_size = FRAMESIZE_INVALID;
+        camera_note_deinit_locked();
         peripheral_arbiter_release(PERIPHERAL_USER_CAMERA);
     }
 
@@ -326,6 +349,7 @@ static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame
     if (err != ESP_OK) {
         (void)esp_camera_deinit();
         s_last_deinit_us = esp_timer_get_time();
+        camera_note_deinit_locked();
         peripheral_arbiter_release(PERIPHERAL_USER_CAMERA);
         xSemaphoreGive(s_mutex);
         ESP_LOGE(TAG, "camera init failed: %s", esp_err_to_name(err));
@@ -337,12 +361,15 @@ static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor) {
         camera_apply_sensor_profile(sensor, pixel_format, effective_frame_size);
+        s_af_status.supported = esp_camera_af_is_supported(sensor);
+        s_af_status.sensor_pid = sensor->id.PID;
         ESP_LOGI(TAG, "camera PID=0x%04x", sensor->id.PID);
     }
 
     s_active = true;
     s_pixel_format = pixel_format;
     s_frame_size = effective_frame_size;
+    s_last_activity_us = esp_timer_get_time();
     peripheral_arbiter_release(PERIPHERAL_USER_CAMERA);
     xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "camera init done in %lld ms format=%d frame=%d",
@@ -353,7 +380,7 @@ static esp_err_t camera_mgr_init_for(pixformat_t pixel_format, framesize_t frame
 
 esp_err_t camera_mgr_init(void)
 {
-    return camera_mgr_init_for(PIXFORMAT_JPEG, CAMERA_WEB_FRAME_SIZE);
+    return camera_mgr_init_for(PIXFORMAT_JPEG, CAMERA_WEB_FRAME_SIZE, NULL);
 }
 
 static void camera_prewarm_task(void *arg)
@@ -413,6 +440,7 @@ void camera_mgr_deinit(void)
     s_last_deinit_us = esp_timer_get_time();
     s_active = false;
     s_frame_size = FRAMESIZE_INVALID;
+    camera_note_deinit_locked();
     peripheral_arbiter_release(PERIPHERAL_USER_CAMERA);
     xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "camera deinit done");
@@ -444,7 +472,7 @@ esp_err_t camera_mgr_capture_scan_jpeg(camera_fb_t **fb)
         return ESP_ERR_INVALID_ARG;
     }
     *fb = NULL;
-    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_JPEG, CAMERA_SCAN_JPEG_FRAME_SIZE),
+    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_JPEG, CAMERA_SCAN_JPEG_FRAME_SIZE, NULL),
                         TAG, "init scan jpeg failed");
     if (BOARD_CAMERA_SCAN_SETTLE_MS > 0) {
         vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_SCAN_SETTLE_MS));
@@ -484,7 +512,7 @@ static esp_err_t camera_mgr_capture_rgb565_frame(framesize_t frame_size, const c
         return ESP_ERR_INVALID_ARG;
     }
     *fb = NULL;
-    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_RGB565, frame_size),
+    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_RGB565, frame_size, NULL),
                         TAG, "init %s rgb565 failed", label ? label : "frame");
     bool scan_frame = label && strstr(label, "scan");
     if (scan_frame) {
@@ -568,11 +596,12 @@ static esp_err_t camera_mgr_capture_grayscale_frame(framesize_t frame_size, cons
         return ESP_ERR_INVALID_ARG;
     }
     *fb = NULL;
-    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_GRAYSCALE, frame_size),
+    bool reused = false;
+    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_GRAYSCALE, frame_size, &reused),
                         TAG, "init %s grayscale failed", label ? label : "frame");
     bool scan_frame = label && strstr(label, "scan");
     int64_t start_us = esp_timer_get_time();
-    if (scan_frame) {
+    if (scan_frame && !reused) {
         if (BOARD_CAMERA_SCAN_SETTLE_MS > 0) {
             vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_SCAN_SETTLE_MS));
         }
@@ -721,6 +750,21 @@ esp_err_t camera_mgr_capture_scan_grayscale(camera_fb_t **fb)
                                            "scan rgb565 fallback", fb);
 }
 
+esp_err_t camera_mgr_capture_scan_grayscale_fast(camera_fb_t **fb)
+{
+    esp_err_t err = camera_mgr_capture_grayscale_frame(CAMERA_SCAN_FAST_FRAME_SIZE,
+                                                       "scan fast gray", fb);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "fast grayscale scan failed, falling back to RGB565 lowmem: %s",
+             esp_err_to_name(err));
+    camera_mgr_deinit();
+    return camera_mgr_capture_rgb565_frame(CAMERA_RGB565_LOW_MEM_FRAME_SIZE,
+                                           "scan fast rgb565 fallback", fb);
+}
+
 esp_err_t camera_mgr_capture_scan_rgb565(camera_fb_t **fb)
 {
     return camera_mgr_capture_rgb565_frame(CAMERA_SCAN_RGB_FRAME_SIZE, "scan rgb565", fb);
@@ -747,7 +791,7 @@ esp_err_t camera_mgr_capture_preview_rgb565(camera_fb_t **fb)
         return ESP_ERR_INVALID_ARG;
     }
     *fb = NULL;
-    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_RGB565, CAMERA_PREVIEW_FRAME_SIZE),
+    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_RGB565, CAMERA_PREVIEW_FRAME_SIZE, NULL),
                         TAG, "init preview rgb565 failed");
     int64_t start_us = esp_timer_get_time();
     camera_fb_t *frame = esp_camera_fb_get();
@@ -771,7 +815,7 @@ esp_err_t camera_mgr_capture_preview_rgb565_lowmem(camera_fb_t **fb)
         return ESP_ERR_INVALID_ARG;
     }
     *fb = NULL;
-    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_RGB565, CAMERA_RGB565_LOW_MEM_FRAME_SIZE),
+    ESP_RETURN_ON_ERROR(camera_mgr_init_for(PIXFORMAT_RGB565, CAMERA_RGB565_LOW_MEM_FRAME_SIZE, NULL),
                         TAG, "init lowmem preview rgb565 failed");
     int64_t start_us = esp_timer_get_time();
     camera_fb_t *frame = esp_camera_fb_get();
@@ -793,6 +837,7 @@ void camera_mgr_release_frame(camera_fb_t *fb)
 {
     if (fb) {
         esp_camera_fb_return(fb);
+        s_last_activity_us = esp_timer_get_time();
     }
 }
 
@@ -809,4 +854,136 @@ void camera_mgr_set_keep_online(bool keep_online)
 bool camera_mgr_is_active(void)
 {
     return s_active;
+}
+
+esp_err_t camera_mgr_autofocus(camera_af_result_t *result)
+{
+    if (!result) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    result->last_err = ESP_ERR_INVALID_STATE;
+    int64_t start_us = esp_timer_get_time();
+
+    if (!s_active) {
+        esp_err_t init_err = camera_mgr_init();
+        if (init_err != ESP_OK) {
+            result->last_err = init_err;
+            result->elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+            s_af_status = *result;
+            return init_err;
+        }
+    }
+
+    esp_err_t err = ensure_mutex();
+    if (err != ESP_OK) {
+        result->last_err = err;
+        s_af_status = *result;
+        return err;
+    }
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        result->last_err = ESP_ERR_TIMEOUT;
+        result->elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+        s_af_status = *result;
+        return result->last_err;
+    }
+
+    err = peripheral_arbiter_acquire(PERIPHERAL_USER_CAMERA, 3000);
+    if (err != ESP_OK) {
+        result->last_err = err;
+        result->elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+        s_af_status = *result;
+        xSemaphoreGive(s_mutex);
+        return err;
+    }
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (!sensor) {
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        result->sensor_pid = sensor->id.PID;
+        result->supported = esp_camera_af_is_supported(sensor);
+        if (!result->supported) {
+            err = ESP_ERR_NOT_SUPPORTED;
+        } else if (!s_af_initialized) {
+            esp_camera_af_config_t config = {
+                .mode = ESP_CAMERA_AF_MODE_MANUAL,
+                .step_size = 0,
+                .range_min = 0,
+                .range_max = 0,
+                .timeout_ms = BOARD_CAMERA_AF_TIMEOUT_MS,
+            };
+            err = esp_camera_af_init(sensor, &config);
+            if (err == ESP_OK) {
+                s_af_initialized = true;
+            }
+        } else {
+            err = esp_camera_af_set_mode(sensor, ESP_CAMERA_AF_MODE_MANUAL);
+        }
+
+        result->initialized = s_af_initialized;
+        if (err == ESP_OK) {
+            err = esp_camera_af_trigger(sensor);
+        }
+        if (err == ESP_OK) {
+            esp_camera_af_status_t status = {0};
+            err = esp_camera_af_wait(sensor, BOARD_CAMERA_AF_TIMEOUT_MS, &status);
+            result->raw_status = status.raw;
+            result->focused = status.focused;
+            result->busy = status.busy;
+            if (err == ESP_OK && !status.focused) {
+                err = ESP_ERR_NOT_FOUND;
+            }
+        }
+    }
+
+    result->last_err = err;
+    result->elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+    s_last_activity_us = esp_timer_get_time();
+    s_af_status = *result;
+    peripheral_arbiter_release(PERIPHERAL_USER_CAMERA);
+    xSemaphoreGive(s_mutex);
+    ESP_LOGI(TAG,
+             "manual AF err=%s supported=%d initialized=%d focused=%d busy=%d raw=0x%02x pid=0x%04x ms=%lu",
+             esp_err_to_name(err), result->supported, result->initialized,
+             result->focused, result->busy, result->raw_status, result->sensor_pid,
+             (unsigned long)result->elapsed_ms);
+    return err;
+}
+
+camera_af_result_t camera_mgr_get_af_status(void)
+{
+    return s_af_status;
+}
+
+bool camera_mgr_maintenance(uint32_t idle_timeout_ms)
+{
+    if (!s_active || camera_mgr_should_keep_online() || idle_timeout_ms == 0 ||
+        s_last_activity_us <= 0 || ensure_mutex() != ESP_OK) {
+        return false;
+    }
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return false;
+    }
+    int64_t idle_ms = (esp_timer_get_time() - s_last_activity_us) / 1000;
+    bool should_deinit = s_active && !camera_mgr_should_keep_online() &&
+                         idle_ms >= idle_timeout_ms;
+    if (!should_deinit) {
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+    esp_err_t arb_err = peripheral_arbiter_acquire(PERIPHERAL_USER_CAMERA, 50);
+    if (arb_err != ESP_OK) {
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+    esp_camera_deinit();
+    s_last_deinit_us = esp_timer_get_time();
+    s_active = false;
+    s_frame_size = FRAMESIZE_INVALID;
+    camera_note_deinit_locked();
+    peripheral_arbiter_release(PERIPHERAL_USER_CAMERA);
+    xSemaphoreGive(s_mutex);
+    ESP_LOGI(TAG, "maintenance released idle camera after %lld ms", (long long)idle_ms);
+    return true;
 }
