@@ -14,6 +14,7 @@
 #define APP_CONFIG_DEVICE_NAME_LEN     48
 #define APP_CONFIG_DISPLAY_DRIVER_LEN  16
 #define APP_CONFIG_DISPLAY_ORIENT_LEN  12
+#define APP_CONFIG_LANGUAGE_LEN        12
 
 typedef struct {
     char device_name[APP_CONFIG_DEVICE_NAME_LEN];
@@ -21,6 +22,7 @@ typedef struct {
     char wifi_pass[APP_CONFIG_WIFI_PASS_LEN];
     char partdb_url[APP_CONFIG_URL_LEN];
     char partdb_token[APP_CONFIG_TOKEN_LEN];
+    char camera_upload_url[APP_CONFIG_URL_LEN];
     char device_secret[APP_CONFIG_SECRET_LEN];
     char boot_image_path[APP_CONFIG_PATH_LEN];
     char font_dir[APP_CONFIG_PATH_LEN];
@@ -28,6 +30,7 @@ typedef struct {
     char screen_bg_path[APP_CONFIG_PATH_LEN];
     char boot_anim_path[APP_CONFIG_PATH_LEN];
     char lock_bg_path[APP_CONFIG_PATH_LEN];
+    char ui_language[APP_CONFIG_LANGUAGE_LEN];
     char display_driver[APP_CONFIG_DISPLAY_DRIVER_LEN];
     char display_orientation[APP_CONFIG_DISPLAY_ORIENT_LEN];
     bool display_flip;
@@ -36,7 +39,9 @@ typedef struct {
     bool touch_flip_y;
     bool ap_enabled;
     bool wifi_provisioned;
+    bool nfc_read_confirm;
     uint8_t display_brightness;
+    uint8_t screen_sleep_minutes;
     uint8_t touch_rotation;
     uint16_t display_width;
     uint16_t display_height;

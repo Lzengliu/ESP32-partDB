@@ -19,3 +19,4 @@ esp_err_t soft_i2c_read(uint8_t addr, uint8_t *data, size_t len, unsigned timeou
 esp_err_t soft_i2c_write_read(uint8_t addr, const uint8_t *wr, size_t wr_len,
                               uint8_t *rd, size_t rd_len, unsigned timeout_ms);
 esp_err_t soft_i2c_recover(unsigned timeout_ms);
+esp_err_t soft_i2c_release(void);

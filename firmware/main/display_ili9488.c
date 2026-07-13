@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "ili9488";
@@ -24,13 +25,17 @@ static char s_orientation[12] = "portrait";
 static bool s_flip = true;
 static uint16_t s_width = 320;
 static uint16_t s_height = 480;
+static SemaphoreHandle_t s_draw_mutex;
+static uint8_t *s_tx_buf;
+static size_t s_tx_buf_len;
 
 #define LCD_BL_LEDC_MODE       LEDC_LOW_SPEED_MODE
 #define LCD_BL_LEDC_TIMER      LEDC_TIMER_1
 #define LCD_BL_LEDC_CHANNEL    LEDC_CHANNEL_1
 #define LCD_BL_LEDC_RES        LEDC_TIMER_10_BIT
 #define LCD_BL_LEDC_MAX_DUTY   1023
-#define LCD_BL_LEDC_HZ         20000
+#define LCD_BL_LEDC_HZ         50000
+#define LCD_TX_CHUNK_ROWS      8
 
 static esp_err_t backlight_init(void)
 {
@@ -112,6 +117,31 @@ static bool driver_supported(void)
     return strcmp(s_driver, "ili9488") == 0;
 }
 
+static esp_err_t ensure_draw_mutex(void)
+{
+    if (!s_draw_mutex) {
+        s_draw_mutex = xSemaphoreCreateMutex();
+        if (!s_draw_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t lock_lcd(void)
+{
+    ESP_RETURN_ON_ERROR(ensure_draw_mutex(), TAG, "draw mutex failed");
+    return xSemaphoreTake(s_draw_mutex, pdMS_TO_TICKS(5000)) == pdTRUE ?
+           ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void unlock_lcd(void)
+{
+    if (s_draw_mutex) {
+        xSemaphoreGive(s_draw_mutex);
+    }
+}
+
 static uint8_t madctl_for_orientation(void)
 {
     if (strcmp(s_orientation, "landscape") == 0) {
@@ -126,6 +156,22 @@ static esp_err_t apply_orientation(void)
     return lcd_cmd_data(0x36, &madctl, 1);
 }
 
+static esp_err_t apply_orientation_locked(void)
+{
+    ESP_RETURN_ON_ERROR(lock_lcd(), TAG, "lcd lock failed");
+    esp_err_t err = apply_orientation();
+    unlock_lcd();
+    return err;
+}
+
+static esp_err_t lcd_cmd_locked(uint8_t cmd)
+{
+    ESP_RETURN_ON_ERROR(lock_lcd(), TAG, "lcd lock failed");
+    esp_err_t err = lcd_cmd(cmd);
+    unlock_lcd();
+    return err;
+}
+
 static void rgb565_to_rgb666_bytes(uint16_t rgb565, uint8_t out[3])
 {
     uint8_t r5 = (rgb565 >> 11) & 0x1f;
@@ -138,12 +184,41 @@ static void rgb565_to_rgb666_bytes(uint16_t rgb565, uint8_t out[3])
     out[2] = b6 << 2;
 }
 
+static esp_err_t ensure_draw_resources(void)
+{
+    ESP_RETURN_ON_ERROR(ensure_draw_mutex(), TAG, "draw mutex failed");
+
+    size_t needed = (size_t)s_width * LCD_TX_CHUNK_ROWS * 3;
+    if (needed == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_tx_buf && s_tx_buf_len >= needed) {
+        return ESP_OK;
+    }
+
+    uint8_t *buf = heap_caps_malloc(needed, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!buf) {
+        ESP_LOGE(TAG, "display DMA buffer alloc failed bytes=%u internal_largest=%u",
+                 (unsigned)needed,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        return ESP_ERR_NO_MEM;
+    }
+    if (s_tx_buf) {
+        heap_caps_free(s_tx_buf);
+    }
+    s_tx_buf = buf;
+    s_tx_buf_len = needed;
+    return ESP_OK;
+}
+
 esp_err_t display_ili9488_configure(const char *driver, uint16_t width, uint16_t height,
                                     const char *orientation, bool flip)
 {
-    if (driver && driver[0]) {
-        snprintf(s_driver, sizeof(s_driver), "%s", driver);
+    if (driver && driver[0] && strcmp(driver, "ili9488") != 0) {
+        ESP_LOGW(TAG, "display driver %s is not supported", driver);
+        return ESP_ERR_NOT_SUPPORTED;
     }
+    snprintf(s_driver, sizeof(s_driver), "ili9488");
     if (orientation && strcmp(orientation, "landscape") == 0) {
         snprintf(s_orientation, sizeof(s_orientation), "landscape");
     } else {
@@ -157,12 +232,8 @@ esp_err_t display_ili9488_configure(const char *driver, uint16_t width, uint16_t
         s_height = height;
     }
 
-    if (!driver_supported()) {
-        ESP_LOGW(TAG, "display driver %s is configured but not implemented yet", s_driver);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
     if (s_ready) {
-        ESP_RETURN_ON_ERROR(apply_orientation(), TAG, "orientation failed");
+        ESP_RETURN_ON_ERROR(apply_orientation_locked(), TAG, "orientation failed");
         return display_ili9488_clear(0x0000);
     }
     return ESP_OK;
@@ -301,29 +372,34 @@ esp_err_t display_ili9488_fill_rect(int x, int y, int w, int h, uint16_t rgb565)
         return ESP_OK;
     }
 
-    ESP_RETURN_ON_ERROR(lcd_set_window(x, y, w, h), TAG, "window failed");
-
-    const int pixels_per_chunk = s_width * 20;
-    uint8_t *buf = heap_caps_malloc(pixels_per_chunk * 3, MALLOC_CAP_DMA);
-    if (!buf) {
-        return ESP_ERR_NO_MEM;
+    ESP_RETURN_ON_ERROR(ensure_draw_resources(), TAG, "draw resources failed");
+    if (xSemaphoreTake(s_draw_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
+
+    esp_err_t err = lcd_set_window(x, y, w, h);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_draw_mutex);
+        ESP_LOGE(TAG, "window failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    int pixels_per_chunk = (int)(s_tx_buf_len / 3);
     uint8_t color[3];
     rgb565_to_rgb666_bytes(rgb565, color);
     for (int i = 0; i < pixels_per_chunk; i++) {
-        buf[i * 3] = color[0];
-        buf[i * 3 + 1] = color[1];
-        buf[i * 3 + 2] = color[2];
+        s_tx_buf[i * 3] = color[0];
+        s_tx_buf[i * 3 + 1] = color[1];
+        s_tx_buf[i * 3 + 2] = color[2];
     }
 
     int remaining = w * h;
-    esp_err_t err = ESP_OK;
     while (remaining > 0 && err == ESP_OK) {
         int chunk = remaining > pixels_per_chunk ? pixels_per_chunk : remaining;
-        err = lcd_tx(buf, chunk * 3);
+        err = lcd_tx(s_tx_buf, chunk * 3);
         remaining -= chunk;
     }
-    heap_caps_free(buf);
+    xSemaphoreGive(s_draw_mutex);
     return err;
 }
 
@@ -336,17 +412,21 @@ esp_err_t display_ili9488_draw_bitmap565(int x, int y, int w, int h, const uint1
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_RETURN_ON_ERROR(lcd_set_window(x, y, w, h), TAG, "window failed");
-
-    const int pixels_per_chunk = s_width * 20;
-    uint8_t *buf = heap_caps_malloc(pixels_per_chunk * 3, MALLOC_CAP_DMA);
-    if (!buf) {
-        return ESP_ERR_NO_MEM;
+    ESP_RETURN_ON_ERROR(ensure_draw_resources(), TAG, "draw resources failed");
+    if (xSemaphoreTake(s_draw_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
+    esp_err_t err = lcd_set_window(x, y, w, h);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_draw_mutex);
+        ESP_LOGE(TAG, "window failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    int pixels_per_chunk = (int)(s_tx_buf_len / 3);
     int total = w * h;
     int done = 0;
-    esp_err_t err = ESP_OK;
     while (done < total && err == ESP_OK) {
         int chunk = total - done;
         if (chunk > pixels_per_chunk) {
@@ -355,14 +435,14 @@ esp_err_t display_ili9488_draw_bitmap565(int x, int y, int w, int h, const uint1
         for (int i = 0; i < chunk; i++) {
             uint8_t color[3];
             rgb565_to_rgb666_bytes(pixels[done + i], color);
-            buf[i * 3] = color[0];
-            buf[i * 3 + 1] = color[1];
-            buf[i * 3 + 2] = color[2];
+            s_tx_buf[i * 3] = color[0];
+            s_tx_buf[i * 3 + 1] = color[1];
+            s_tx_buf[i * 3 + 2] = color[2];
         }
-        err = lcd_tx(buf, chunk * 3);
+        err = lcd_tx(s_tx_buf, chunk * 3);
         done += chunk;
     }
-    heap_caps_free(buf);
+    xSemaphoreGive(s_draw_mutex);
     return err;
 }
 
@@ -392,7 +472,7 @@ esp_err_t display_ili9488_set_awake(bool awake)
     }
 
     if (s_ready && s_awake != awake) {
-        esp_err_t err = lcd_cmd(awake ? 0x29 : 0x28);
+        esp_err_t err = lcd_cmd_locked(awake ? 0x29 : 0x28);
         if (err != ESP_OK) {
             return err;
         }

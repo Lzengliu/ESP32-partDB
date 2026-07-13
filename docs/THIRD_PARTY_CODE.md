@@ -1,79 +1,46 @@
 # 引用代码与第三方组件说明
 
-版本：V1.0
+版本：V1.1
 
-## ESP-IDF
+## ESP-IDF 与管理组件
 
-本固件基于 Espressif ESP-IDF 构建。
-
-- 构建目标：ESP32-S3
-- V1.0 实测构建环境：ESP-IDF v5.5.2
-- 协议：ESP-IDF 各组件按其原始协议发布，主体通常为 Apache-2.0
-- 获取方式：用户本机安装 ESP-IDF，不在本仓库中提交 ESP-IDF 源码
-
-## ESP-IDF Component Manager 依赖
-
-`firmware/main/idf_component.yml` 直接声明：
-
-```yaml
-dependencies:
-  espressif/esp32-camera: "^2.0.15"
-  espressif/quirc: "^1.2.0"
-```
-
-`firmware/dependencies.lock` 当前锁定：
+V1.1 使用 ESP-IDF v5.5.2，目标为 ESP32-S3。`firmware/dependencies.lock` 锁定：
 
 | 组件 | 版本 | 用途 | 协议 |
 | --- | --- | --- | --- |
-| `espressif/esp32-camera` | 2.1.7 | ESP32 摄像头驱动 | Apache-2.0 |
-| `espressif/esp_jpeg` | 1.3.1 | JPEG 解码依赖 | Apache-2.0 |
-| `espressif/quirc` | 1.2.0 | 二维码识别 | ISC |
+| ESP-IDF | 5.5.2 | 框架与芯片支持 | 各组件原始协议，主体 Apache-2.0 |
+| `espressif/esp32-camera` | 2.1.7 | 相机驱动 | Apache-2.0 |
+| `espressif/esp_jpeg` | 1.3.1 | JPEG 解码 | Apache-2.0 |
+| `espressif/quirc` | 1.2.0 | QR 回退解码 | ISC |
 
-建议 GitHub 源码仓库保留 `dependencies.lock`，但不要提交 `firmware/managed_components/`，让 ESP-IDF Component Manager 在构建时下载。
+源码包不提交 `firmware/managed_components/`；ESP-IDF Component Manager 在首次构建时按锁文件获取它们。
 
-## quirc
+## ZXing-C++
 
-quirc 是二维码识别库，上游作者为 Daniel Beer。
+- 上游：https://github.com/zxing-cpp/zxing-cpp
+- 固定提交：`6c2961d2a9ea4bc4e4ae8f37b1497299f04dd861`
+- 协议：Apache License 2.0
+- 本地路径：`third_party/zxing-cpp`
 
-本项目通过 `espressif/quirc` 使用 quirc，用于摄像头扫码识别。quirc 原始协议为 ISC license，应保留其版权和许可声明。
+`firmware/components/zxing_qr` 只编译 QR Code reader 所需的稀疏源码。V1.1 本地扫码先调用 ZXing-C++，未识别时回退到 quirc。上游 LICENSE 随源码包保留。
 
-## GNU Unifont 派生字模
+## 生成字模
 
-`firmware/main/calendar_font_data.h` 文件头标注：
+`firmware/main/calendar_font_data.h` 的 16 px 字模来自 GNU Unifont 16.0.02。
 
-```text
-Source: GNU Unifont 16.0.02
-```
+`firmware/main/ui_font_sizes_data.h` 的 8/12 px 字模主要来自：
 
-该文件是从 GNU Unifont 生成的点阵字模数据。它不是项目自有 Apache-2.0 代码。发布时应把它作为第三方字体数据处理，并保留来源说明。
+- 江城斜黑体 200W / JiangChengXieHei 200W，Version 2.0
+- 字体作者：Liu Peng / 刘鹏
+- 原始字体元数据协议：SIL Open Font License 1.1
+- 缺字回退：GNU Unifont
 
-建议发布前复核：
-
-- 是否保留该内置字模。
-- 是否需要在仓库中附带 GNU Unifont 的完整许可文本。
-- 是否改为使用项目自绘的小字符集，减少字体协议复杂度。
+本项目按 SIL OFL 1.1 分发生成后的字体数据，完整文本在 `docs/licenses/OFL-1.1.txt`。这些字模不适用项目 Apache-2.0 许可证。字体生成脚本引用的本地 TTF 和 Unifont 源文件不随公开源码包发布。
 
 ## Part-DB
 
-Part-DB 是外部元器件管理系统。本固件仅通过 HTTP API 对接 Part-DB，不包含 Part-DB 服务端代码。
+Part-DB 是独立上游项目：https://github.com/Part-DB/Part-DB-server 。本固件只调用其 HTTP API，不打包服务端源码。
 
-本工作区中的 `Part-DB-server-master/` 属于本地参考资料，不应纳入本项目源码包。公开仓库中只需要说明兼容的 API 路径和配置方法。
+## 本项目自有实现
 
-## 硬件资料和供应商示例
-
-本地工作区中包含屏幕、PN532、ESP32-S3 CAM 等硬件资料和供应商示例。这些资料用于开发参考，不建议直接上传到本项目 GitHub 源码仓库。
-
-建议只在 README 中列出硬件型号和接线说明，必要时链接到厂商公开页面或数据手册原始来源。
-
-## 自有实现
-
-以下模块为本项目自有实现或集成代码：
-
-- Part-DB HTTP 客户端和搜索/详情/库存逻辑。
-- ILI9488 SPI 显示驱动。
-- FT6336 触摸读取和坐标映射。
-- PN532 I2C/NDEF 文本读写尝试实现。
-- 设备端触摸 UI 和软键盘。
-- Web 管理页和 HTTP API。
-- TF 卡资源管理。
-- 硬件诊断与状态接口。
+Part-DB 客户端与工作流、ILI9488 显示、FT6336 触摸适配、PN532/NDEF 服务、设备 UI、Web 管理页、TF 资源管理、外设仲裁和硬件诊断属于本项目自有实现，并按根目录 Apache-2.0 许可证发布。

@@ -1,34 +1,49 @@
 # Notices
 
-ESP32 Part-DB Terminal
+ESP32-partDB / ESP32 Part-DB Terminal
 
-Copyright 2026 ESP32 Part-DB Terminal Project contributors.
+Copyright 2026 灵异大队长.
 
-This repository's original project source code is licensed under the Apache
-License, Version 2.0, except where a file or third-party notice states
+Project repository: https://github.com/Lzengliu/ESP32-partDB
+
+The original project source code in this repository is licensed under the
+Apache License, Version 2.0, except where a file or this notice states
 otherwise.
 
-## Third-party and external materials
+## Third-party software
 
-The following materials are used by or referenced from the project and remain
-under their own licenses:
+- ESP-IDF and its components: Espressif Systems and contributors; individual
+  component licenses apply, with the framework primarily under Apache-2.0.
+- `espressif/esp32-camera` 2.1.7: Espressif Systems; Apache-2.0.
+- `espressif/esp_jpeg` 1.3.1: Espressif Systems; Apache-2.0.
+- `espressif/quirc` 1.2.0 and upstream quirc: Daniel Beer; ISC license.
+- `third_party/zxing-cpp`: ZXing-C++ contributors; Apache-2.0. The V1.1
+  firmware links a reader-only QR Code subset from upstream commit
+  `6c2961d2a9ea4bc4e4ae8f37b1497299f04dd861`. Its license is retained in
+  `third_party/zxing-cpp/LICENSE`.
 
-- ESP-IDF and bundled ESP-IDF components: Espressif Systems, mostly Apache-2.0.
-- `espressif/esp32-camera`: Espressif Systems, Apache-2.0.
-- `espressif/esp_jpeg`: Espressif Systems, Apache-2.0.
-- `espressif/quirc` and upstream quirc: Daniel Beer, ISC license.
-- Generated glyph data in `firmware/main/calendar_font_data.h`: generated from
-  GNU Unifont 16.0.02. Treat this font data as separate from the Apache-2.0
-  project code; see `docs/THIRD_PARTY_CODE.md` before publishing.
-- Part-DB is an external upstream project and service target. This firmware only
-  integrates with Part-DB through its HTTP API. Part-DB server source is not part
-  of the V1.0 open-source package.
-- Hardware datasheets, vendor examples and local reference archives are not part
-  of the public source package unless explicitly copied into a release.
+## Font data
+
+Generated bitmap data in `firmware/main/calendar_font_data.h` is derived from
+GNU Unifont 16.0.02. Generated bitmap data in
+`firmware/main/ui_font_sizes_data.h` is derived from JiangChengXieHei 200W
+(江城斜黑体 200W, Version 2.0, author Liu Peng / 刘鹏) with GNU Unifont fallback
+glyphs. These font data are distributed under the SIL Open Font License 1.1,
+not the project's Apache-2.0 license. See `docs/licenses/OFL-1.1.txt`.
+
+The original TTF and GNU Unifont source files used by the local generator are
+not included in the public source package. The generated headers retain their
+source attribution.
+
+## External projects and local material
+
+Part-DB is an external project. This firmware communicates with it through its
+HTTP API and does not include the Part-DB server source. Local hardware
+archives, vendor examples, historical builds and private development material
+are not part of the public source package.
 
 ## Release binaries
 
-V1.0 release binaries are build artifacts generated from this source tree and
-the ESP-IDF toolchain. They include linked third-party components and generated
-font data. Keep this NOTICE file and the release notes together with binary
-downloads.
+V1.1 binaries are build artifacts generated with ESP-IDF v5.5.2. They include
+linked third-party software and generated font data. Distribute this NOTICE,
+the root LICENSE, the OFL text and the V1.1 release notes with binary packages.

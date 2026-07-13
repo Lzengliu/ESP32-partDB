@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "nfc_pn532.h"
 
 typedef struct {
     bool started;
@@ -22,5 +23,12 @@ typedef struct {
 
 esp_err_t nfc_service_start(void);
 nfc_service_status_t nfc_service_get_status(void);
+bool nfc_service_get_active_tag(nfc_tag_t *out, int64_t max_age_ms);
+esp_err_t nfc_service_claim_tag(nfc_tag_t *out, unsigned timeout_ms);
+void nfc_service_release_tag(void);
+void nfc_service_note_tag_payload(const nfc_tag_t *tag, const char *text);
+esp_err_t nfc_service_restart(unsigned timeout_ms);
+void nfc_service_suspend_for_camera(void);
+void nfc_service_resume_after_camera(void);
 void nfc_service_suspend_for_request(void);
 void nfc_service_resume_after_request(void);

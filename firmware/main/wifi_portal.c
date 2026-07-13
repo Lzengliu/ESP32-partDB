@@ -1,11 +1,14 @@
 #include "wifi_portal.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "board_config.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 
@@ -16,11 +19,26 @@ static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static bool s_initialized;
 static bool s_wifi_started;
+static bool s_time_sync_started;
 static app_config_t *s_cfg;
 static int s_sta_disconnect_count;
 static bool s_recovery_ap_started;
 
 static esp_err_t configure_ap(void);
+
+static void start_time_sync_once(void)
+{
+    if (s_time_sync_started || esp_sntp_enabled()) {
+        return;
+    }
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    s_time_sync_started = true;
+    ESP_LOGI(TAG, "SNTP time sync started");
+}
 
 static bool should_start_ap(const app_config_t *cfg)
 {
@@ -80,6 +98,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_status.sta_connected = true;
         s_sta_disconnect_count = 0;
         ESP_LOGI(TAG, "STA IP: %s", s_status.ip);
+        start_time_sync_once();
         if (s_cfg && app_config_has_wifi(s_cfg) && !s_cfg->wifi_provisioned) {
             s_cfg->wifi_provisioned = true;
             s_cfg->ap_enabled = false;
@@ -94,8 +113,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
         s_status.ap_started = true;
-        ESP_LOGI(TAG, "AP started: ssid=\"%s\" password=\"%s\" url=http://192.168.4.1/",
-                 BOARD_AP_DEFAULT_SSID, BOARD_AP_DEFAULT_PASS);
+        ESP_LOGI(TAG, "AP started: ssid=\"%s\" url=http://192.168.4.1/",
+                 BOARD_AP_DEFAULT_SSID);
     }
 }
 

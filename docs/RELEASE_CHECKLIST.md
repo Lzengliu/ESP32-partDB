@@ -1,34 +1,37 @@
 # GitHub 开源发布检查清单
 
-版本：V1.0
+版本：V1.1
 
-## 源码仓库
+## 源码
 
-- [ ] 确认版权主体名称。
-- [ ] 确认根目录 `LICENSE`、`NOTICE.md`、`README.md` 已保留。
-- [ ] 确认 `docs/` 中的说明不包含私人路径、密钥或内部地址。
-- [ ] 确认 `.gitignore` 生效，不上传 `firmware/build/`。
-- [ ] 确认不上传本地 `硬件资料/`、`Part-DB-server-master/`、`backups/`。
-- [ ] 确认 `firmware/sdkconfig` 是否保留；如不保留，至少保留 `sdkconfig.defaults`。
-- [ ] 确认 `firmware/dependencies.lock` 保留，便于复现 V1.0 依赖。
+- [x] 作者和仓库地址已写入固件、README、AUTHORS、NOTICE 和开源声明。
+- [x] V1.0 历史文档保留，V1.1 差异和 Release 文案单独新增。
+- [x] 公开源码范围排除构建缓存、本地资料、参考服务端、密钥和嵌套 `.git`。
+- [x] `dependencies.lock` 和 ZXing-C++ 固定提交信息保留。
+- [x] 第三方软件与字体许可证声明补齐。
+- [x] 检查最终源码包文件清单和敏感信息扫描结果。
 
-## 固件包
+## 构建与固件
 
-- [ ] 确认 `esp32_partdb_terminal_v1.0_firmware.zip` 内含合并固件。
-- [ ] 确认分区刷写文件偏移写在 Release 说明中。
-- [ ] 确认 `SHA256SUMS` 已生成。
-- [ ] 确认固件已实机启动并返回 `/api/status`。
+- [x] ESP-IDF v5.5.2 完整构建通过。
+- [x] 应用版本为 `1.1.0`，应用镜像未超出 `0x480000` 分区。
+- [x] 重新生成 `merged-binary.bin`。
+- [x] 生成 V1.1 固件包、源码包和 `SHA256SUMS`。
+- [x] 校验每个发布附件的 SHA-256。
 
-## 第三方协议
+## 实机回归
 
-- [ ] 确认 ESP-IDF、esp32-camera、esp_jpeg、quirc 声明已保留。
-- [ ] 复核 GNU Unifont 派生字模的发布方式。
-- [ ] 确认 Part-DB 服务端源码不混入本项目源码包。
+- [x] 在 ESP32-S3 上刷写完整合并镜像并冷启动。
+- [x] `/api/status` 返回 `1.1.0`、作者、仓库地址和硬件状态。
+- [x] Web 项目声明显示可点击开源地址。
+- [x] 相机预览/扫码、触摸、TF、NFC 和 Part-DB 基础状态无启动回归。
+- [x] 使用 OTA 应用镜像升级，确认 `OTA image confirmed valid`。
+- [x] OTA 后再次重启，确认没有回滚。
 
-## GitHub Release
+## GitHub
 
-- [ ] Release 标题使用 `ESP32 Part-DB Terminal V1.0`。
-- [ ] 上传 `esp32_partdb_terminal_v1.0_firmware.zip`。
-- [ ] 上传 `esp32_partdb_terminal_v1.0_source.zip`。
-- [ ] 上传 `SHA256SUMS`。
-- [ ] Release 文案引用 `docs/GITHUB_RELEASE_V1.0.md`。
+- [ ] 确认目标仓库远端当前分支和需要保留的历史。
+- [ ] 使用整理后的 V1.1 源码内容更新仓库。
+- [ ] 创建 `v1.1` Release。
+- [ ] 上传 firmware zip、source zip、merged bin、OTA bin 与 `SHA256SUMS`。
+- [ ] Release 文案采用 `docs/GITHUB_RELEASE_V1.1.md`。

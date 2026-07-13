@@ -13,11 +13,14 @@ typedef enum {
     DEVICE_UI_PAGE_DETAIL,
     DEVICE_UI_PAGE_INFO,
     DEVICE_UI_PAGE_SETTINGS,
+    DEVICE_UI_PAGE_SYSTEM,
+    DEVICE_UI_PAGE_NFC_SETTINGS,
+    DEVICE_UI_PAGE_CAMERA,
     DEVICE_UI_PAGE_COUNT,
     DEVICE_UI_PAGE_PARTDB = DEVICE_UI_PAGE_DETAIL,
-    DEVICE_UI_PAGE_NFC = DEVICE_UI_PAGE_SHORTCUTS,
-    DEVICE_UI_PAGE_CAMERA = DEVICE_UI_PAGE_SHORTCUTS,
-    DEVICE_UI_PAGE_HARDWARE = DEVICE_UI_PAGE_INFO,
+    DEVICE_UI_PAGE_NFC = DEVICE_UI_PAGE_NFC_SETTINGS,
+    DEVICE_UI_PAGE_PARTS = DEVICE_UI_PAGE_INFO,
+    DEVICE_UI_PAGE_HARDWARE = DEVICE_UI_PAGE_SYSTEM,
 } device_ui_page_t;
 
 typedef struct {
@@ -43,6 +46,16 @@ typedef struct {
     uint16_t touch_max_x;
     uint16_t touch_min_y;
     uint16_t touch_max_y;
+    bool nfc_busy;
+    bool nfc_done;
+    bool nfc_ok;
+    uint8_t nfc_action;
+    esp_err_t nfc_last_err;
+    uint32_t nfc_write_count;
+    const char *nfc_payload;
+    const char *nfc_message;
+    uint8_t screen_sleep_minutes;
+    uint32_t idle_ms;
 } device_ui_status_t;
 
 esp_err_t device_ui_start(app_config_t *cfg);

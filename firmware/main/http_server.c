@@ -15,11 +15,14 @@
 #include "camera_mgr.h"
 #include "device_ui.h"
 #include "display_ili9488.h"
+#include "driver/gpio.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_psram.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "hardware_diag.h"
@@ -27,27 +30,33 @@
 #include "nfc_i2c.h"
 #include "nfc_service.h"
 #include "partdb_client.h"
+#include "psram_diag.h"
 #include "storage_sd.h"
 #include "qr_scanner.h"
 #include "touch_ft6336.h"
 #include "ui_font.h"
 #include "wifi_portal.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "cJSON.h"
 
 static const char *TAG = "http";
 static httpd_handle_t s_server;
 static app_config_t *s_cfg;
+static SemaphoreHandle_t s_camera_scan_mutex;
 
 #define HTTP_SD_PATH_MAX 384
 #define ASSET_NAME_MAX 96
 #define ASSET_SCAN_MAX 24
 #define ASSET_SCREEN_BG_LIMIT 5
 #define ASSET_LOCK_BG_LIMIT 5
+#define ASSET_BOOT_IMAGE_LIMIT 1
 #define ASSET_BOOT_ANIM_LIMIT 1
 #define FONT_UPLOAD_MAX_BYTES (32 * 1024 * 1024)
 #define PARTDB_RESPONSE_MAX 8192
+#define CAMERA_UPLOAD_RESPONSE_MAX 2048
+#define HTTP_SERVER_STACK_BYTES 24576
 #define NFC_BARCODE_MAX 128
 
 typedef struct {
@@ -75,47 +84,58 @@ typedef struct {
     char scan_path[64];
 } partdb_barcode_target_t;
 
+static void nfc_restart_after_manual_io(void);
+
+static esp_err_t ensure_camera_scan_mutex(void)
+{
+    if (!s_camera_scan_mutex) {
+        s_camera_scan_mutex = xSemaphoreCreateMutex();
+        if (!s_camera_scan_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
 static const asset_kind_t ASSET_KINDS[] = {
     {.kind = "screen_bg", .label = "屏幕背景图", .rel_dir = "/backgrounds", .limit = ASSET_SCREEN_BG_LIMIT, .animated = false},
+    {.kind = "boot_image", .label = "静态开机图", .rel_dir = "/boot", .limit = ASSET_BOOT_IMAGE_LIMIT, .animated = false},
     {.kind = "boot_anim", .label = "开机动态图片", .rel_dir = "/boot/animation", .limit = ASSET_BOOT_ANIM_LIMIT, .animated = true},
     {.kind = "lock_bg", .label = "锁屏背景图", .rel_dir = "/lockscreen", .limit = ASSET_LOCK_BG_LIMIT, .animated = false},
 };
 
-static void nfc_manual_request_begin(void);
-static void nfc_manual_request_end(void);
-
 static const char INDEX_HTML[] =
 "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>Part-DB Terminal</title><style>:root{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2933;background:#f4f6f8}body{margin:0;letter-spacing:0}"
+"<title>Part-DB Terminal</title><style>:root{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e8f7ff;background:#061014;--panel:#0d1b21;--panel2:#101f28;--line:#24424d;--cyan:#26d9ff;--amber:#ffc857;--muted:#91a9b4;--danger:#ff5d73}body{margin:0;letter-spacing:0;background:#061014;color:#e8f7ff}"
 ".shell{max-width:1080px;margin:0 auto;padding:18px}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px}"
-"h1{font-size:24px;margin:0}h2{font-size:17px;margin:0 0 12px}label{display:block;margin:10px 0 4px;font-size:13px;color:#52606d}"
-"input,select{width:100%;padding:10px;border:1px solid #cbd2d9;border-radius:6px;box-sizing:border-box;background:#fff}input[type=checkbox]{width:auto}"
-"button{border:1px solid #9fb3c8;background:#fff;color:#1f2933;border-radius:6px;padding:9px 12px;margin:4px 6px 4px 0}button.primary{background:#2563eb;color:#fff;border-color:#2563eb}button.danger{border-color:#b91c1c;color:#b91c1c}"
-".tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 16px}.tabs button.active{background:#102a43;color:#fff;border-color:#102a43}"
-".panel{display:none}.panel.active{display:block}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.box{background:#fff;border:1px solid #d9e2ec;border-radius:8px;padding:14px}"
-".wide{grid-column:1/-1}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.metric{background:#fff;border:1px solid #d9e2ec;border-radius:8px;padding:12px;min-height:64px}.metric b{display:block;font-size:13px;color:#52606d}.metric span{display:block;margin-top:6px;font-size:15px}"
-".inline{display:flex;gap:10px;align-items:center}.inline input,.inline select{min-width:0}.msg{min-height:22px;color:#0f7b0f}.muted{color:#66788a;font-size:13px}.result{background:#111827;color:#e5e7eb;border-radius:8px;padding:12px;overflow:auto;min-height:120px;white-space:pre-wrap}.api-log{display:none}.bar{height:10px;background:#d9e2ec;border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:#2563eb}"
-".camview img{display:block;max-width:100%;height:auto;margin-top:8px;border:1px solid #d9e2ec;border-radius:6px}.scanbox{border:1px solid #d9e2ec;border-radius:8px;background:#f8fafc;padding:10px;margin-top:8px}.scanbox b{display:block}.scanbox code{display:block;word-break:break-all;margin-top:6px;color:#102a43}"
-".assetgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:14px 0}.assetcard{background:#fff;border:1px solid #d9e2ec;border-radius:8px;padding:12px}.assetpreview{position:relative;min-height:170px;background:#f4f6f8;border:1px solid #d9e2ec;border-radius:6px;display:flex;align-items:center;justify-content:center;overflow:hidden}.assetpreview img{max-width:100%;max-height:220px}.assetdel{position:absolute;right:8px;bottom:8px;background:#fff;color:#b91c1c;border-color:#b91c1c}.modal{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:18px;z-index:10}.modal.hidden{display:none}.dialog{background:#fff;border-radius:8px;border:1px solid #d9e2ec;padding:16px;max-width:420px;width:100%;box-shadow:0 20px 45px rgba(15,23,42,.24)}"
-".statusrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.statusitem{border:1px solid #d9e2ec;border-radius:8px;padding:10px;background:#fff}.statusitem b{display:block;font-size:13px;color:#52606d}.statusitem span{display:block;margin-top:6px}.ok{color:#0f7b0f}.bad{color:#b91c1c}.wait{color:#8a6d1d}"
-".browser{display:block}.pathbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.filegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}.file{border:1px solid #d9e2ec;background:#fff;border-radius:8px;padding:10px;text-align:left;min-height:84px}.file .ico{font-size:12px;font-weight:700;color:#2563eb}.file .name{display:block;word-break:break-all;margin-top:8px}.file .meta{font-size:12px;color:#66788a;margin-top:4px}.preview{background:#fff;border:1px solid #d9e2ec;border-radius:8px;padding:12px;min-height:220px}.preview img{max-width:100%;height:auto;border-radius:6px;border:1px solid #d9e2ec}"
+"h1{font-size:24px;margin:0;color:#f5fdff}h2{font-size:17px;margin:0 0 12px;color:#f5fdff}label{display:block;margin:10px 0 4px;font-size:13px;color:var(--muted)}"
+"input,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:6px;box-sizing:border-box;background:#071218;color:#e8f7ff}input[type=checkbox]{width:auto}"
+"button{border:1px solid var(--line);background:#0a1820;color:#e8f7ff;border-radius:6px;padding:9px 12px;margin:4px 6px 4px 0}button.primary{background:#063544;color:#fff;border-color:var(--cyan)}button.danger{border-color:var(--danger);color:var(--danger);background:#170b10}"
+".tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 16px}.tabs button.active{background:#092b35;color:#fff;border-color:var(--cyan)}"
+".panel{display:none}.panel.active{display:block}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}"
+".wide{grid-column:1/-1}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px;min-height:64px}.metric b{display:block;font-size:13px;color:var(--muted)}.metric span{display:block;margin-top:6px;font-size:15px;color:#f5fdff}"
+".inline{display:flex;gap:10px;align-items:center}.inline input,.inline select{min-width:0}.msg{min-height:22px;color:var(--cyan)}.muted{color:var(--muted);font-size:13px}.result{background:#03090d;color:#d9f6ff;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;min-height:120px;white-space:pre-wrap}.api-log{display:none}.bar{height:10px;background:#13262d;border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--cyan)}"
+".camview img{display:block;max-width:100%;height:auto;margin-top:8px;border:1px solid var(--line);border-radius:6px}.scanbox{border:1px solid var(--line);border-radius:8px;background:#071218;padding:10px;margin-top:8px}.scanbox b{display:block}.scanbox code{display:block;word-break:break-all;margin-top:6px;color:var(--cyan)}"
+".assetgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:14px 0}.assetcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}.assetpreview{position:relative;min-height:170px;background:#071218;border:1px solid var(--line);border-radius:6px;display:flex;align-items:center;justify-content:center;overflow:hidden}.assetpreview img{max-width:100%;max-height:220px}.assetdel{position:absolute;right:8px;bottom:8px;background:#170b10;color:var(--danger);border-color:var(--danger)}.modal{position:fixed;inset:0;background:rgba(2,8,12,.72);display:flex;align-items:center;justify-content:center;padding:18px;z-index:10}.modal.hidden{display:none}.dialog{background:var(--panel);border-radius:8px;border:1px solid var(--line);padding:16px;max-width:420px;width:100%;box-shadow:0 20px 45px rgba(0,0,0,.35)}"
+".statusrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.statusitem{border:1px solid var(--line);border-radius:8px;padding:10px;background:var(--panel2)}.statusitem b{display:block;font-size:13px;color:var(--muted)}.statusitem span{display:block;margin-top:6px}.ok{color:#53ff9a}.bad{color:var(--danger)}.wait{color:var(--amber)}a{color:var(--cyan);overflow-wrap:anywhere}"
+".browser{display:block}.pathbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.filegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}.file{border:1px solid var(--line);background:var(--panel2);color:#e8f7ff;border-radius:8px;padding:10px;text-align:left;min-height:84px}.file .ico{font-size:12px;font-weight:700;color:var(--cyan)}.file .name{display:block;word-break:break-all;margin-top:8px}.file .meta{font-size:12px;color:var(--muted);margin-top:4px}.preview{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;min-height:220px}.preview img{max-width:100%;height:auto;border-radius:6px;border:1px solid var(--line)}"
 "@media(max-width:760px){.top{display:block}.grid,.cards,.assetgrid{grid-template-columns:1fr}.shell{padding:12px}}</style></head><body><div class=\"shell\">"
 "<div class=\"top\"><div><h1 id=\"device_title\">Part-DB Terminal</h1><div id=\"headline\" class=\"muted\">loading...</div></div><button onclick=\"loadAll()\">刷新</button></div>"
 "<div class=\"cards\"><div class=\"metric\"><b>WiFi</b><span id=\"m_wifi\">-</span></div><div class=\"metric\"><b>AP</b><span id=\"m_ap\">-</span></div><div class=\"metric\"><b>Part-DB</b><span id=\"m_partdb\">-</span></div><div class=\"metric\"><b>TF 卡</b><span id=\"m_tf\">-</span></div><div class=\"metric\"><b>硬件</b><span id=\"m_hw\">-</span></div></div>"
 "<div class=\"tabs\"><button class=\"active\" data-tab=\"overview\" onclick=\"tab('overview')\">总览</button><button data-tab=\"settings\" onclick=\"tab('settings')\">设置</button><button data-tab=\"partdb\" onclick=\"tab('partdb')\">Part-DB</button><button data-tab=\"hardware\" onclick=\"tab('hardware')\">硬件</button><button data-tab=\"resources\" onclick=\"tab('resources')\">资源</button><button data-tab=\"maintenance\" onclick=\"tab('maintenance')\">维护</button></div>"
-"<section id=\"overview\" class=\"panel active\"><div class=\"grid\"><div class=\"box\"><h2>运行状态</h2><div id=\"status_cards\" class=\"statusrow\"></div><pre id=\"status\" class=\"api-log\"></pre></div><div class=\"box\"><h2>快速操作</h2><button onclick=\"enableAp()\">开启 AP</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">抓拍</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"msg\" class=\"msg\"></p><div id=\"qr_result\"></div><div id=\"camera_preview\" class=\"camview\"></div></div></div></section>"
+"<section id=\"overview\" class=\"panel active\"><div class=\"grid\"><div class=\"box\"><h2>运行状态</h2><div id=\"status_cards\" class=\"statusrow\"></div><pre id=\"status\" class=\"api-log\"></pre></div><div class=\"box\"><h2>快速操作</h2><button onclick=\"enableAp()\">开启 AP</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">预览抓图</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"msg\" class=\"msg\"></p><div id=\"qr_result\"></div><div id=\"camera_preview\" class=\"camview\"></div></div></div></section>"
 "<section id=\"settings\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>网络</h2><label>设备名称</label><input id=\"device_name\" data-cfg maxlength=\"47\"><label>WiFi SSID</label><input id=\"wifi_ssid\" data-cfg><label>WiFi 密码</label><input id=\"wifi_pass\" data-cfg type=\"password\" placeholder=\"留空则不修改已保存密码\"><label class=\"inline\"><input id=\"ap_enabled\" data-cfg type=\"checkbox\">启用配置 AP</label><button class=\"primary\" onclick=\"saveCfg()\">保存并重连</button></div>"
 "<div class=\"box\"><h2>资源路径</h2><label>开机图路径</label><p id=\"fixed_boot_image_path\" class=\"muted\"></p><label>字体目录</label><p id=\"fixed_font_dir\" class=\"muted\"></p><label>字体文件</label><select id=\"font_path\" data-cfg onchange=\"fontSelectionChanged()\"><option value=\"\">默认内置字体</option></select><input id=\"font_file\" type=\"file\" accept=\".ttf,.otf,.ttc,.woff,.woff2\"><button onclick=\"uploadFont()\">上传字体</button><button onclick=\"loadFonts()\">刷新字体</button><button id=\"font_delete\" class=\"danger\" onclick=\"deleteFont()\">删除所选字体</button><button class=\"primary\" onclick=\"saveResourceCfg()\">保存字体设置</button><p id=\"font_msg\" class=\"msg\"></p><p id=\"font_count\" class=\"muted\"></p></div>"
-"<div class=\"box\"><h2>显示</h2><label>显示驱动</label><select id=\"display_driver\" data-cfg><option value=\"ili9488\">ILI9488 SPI</option><option value=\"st7789\">ST7789 SPI（预留）</option><option value=\"ili9341\">ILI9341 SPI（预留）</option></select><label>屏幕尺寸</label><select id=\"display_preset\" onchange=\"setDisplayPreset(this.value)\"><option value=\"320x480\">320 x 480</option><option value=\"480x320\">480 x 320</option><option value=\"240x320\">240 x 320</option><option value=\"240x240\">240 x 240</option><option value=\"custom\">自定义</option></select><div class=\"inline\"><input id=\"display_width\" data-cfg type=\"number\" min=\"64\" max=\"1024\"><input id=\"display_height\" data-cfg type=\"number\" min=\"64\" max=\"1024\"></div><label>方向</label><select id=\"display_orientation\" data-cfg><option value=\"portrait\">竖屏</option><option value=\"landscape\">横屏</option></select><label class=\"inline\"><input id=\"display_flip\" data-cfg type=\"checkbox\">翻转 180°</label><label>触摸旋转</label><select id=\"touch_rotation\" data-cfg><option value=\"0\">0°</option><option value=\"1\">90°</option><option value=\"2\">180°</option><option value=\"3\">270°</option></select><label>触摸原始范围</label><div class=\"inline\"><input id=\"touch_raw_width\" data-cfg type=\"number\" min=\"64\" max=\"1024\"><input id=\"touch_raw_height\" data-cfg type=\"number\" min=\"64\" max=\"1024\"></div><label class=\"inline\"><input id=\"touch_swap_xy\" data-cfg type=\"checkbox\">交换触摸 X/Y</label><label class=\"inline\"><input id=\"touch_flip_x\" data-cfg type=\"checkbox\">触摸 X 翻转</label><label class=\"inline\"><input id=\"touch_flip_y\" data-cfg type=\"checkbox\">触摸 Y 翻转</label><label>屏幕亮度 <span id=\"brightness_value\"></span></label><input id=\"display_brightness\" data-cfg type=\"range\" min=\"0\" max=\"100\" step=\"5\" oninput=\"brightness_value.textContent=this.value+'%'\" onchange=\"setBrightness(this.value)\"></div></div></section>"
-"<section id=\"partdb\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>接口配置</h2><label>Part-DB 地址</label><input id=\"partdb_url\" data-cfg placeholder=\"http://partdb.local 或 http://partdb.local/api\"><label>Part-DB API Token</label><input id=\"partdb_token\" data-cfg type=\"password\"><button class=\"primary\" onclick=\"savePartdbCfg()\">保存接口</button><button onclick=\"partdbGet('/api/parts.jsonld?itemsPerPage=1')\">测试元件列表</button><button onclick=\"partdbGet('/api/categories.jsonld?itemsPerPage=1')\">测试分类</button><p id=\"partdb_msg\" class=\"msg\"></p><p class=\"muted\">Token 在 Part-DB 用户设置 / API Tokens 中创建；测试路径固定隐藏，避免误填。</p><pre id=\"partdb_out\" class=\"api-log\"></pre></div></div></section>"
-"<section id=\"hardware\" class=\"panel\"><div class=\"box\"><h2>硬件诊断</h2><div id=\"hw_cards\" class=\"statusrow\"></div><button class=\"primary\" onclick=\"runHardwareDiag()\">重新诊断</button><button onclick=\"diag('/api/display/test')\">显示测试</button><button onclick=\"diag('/api/touch')\">读取触摸</button><button onclick=\"diag('/api/nfc/read')\">读取 NFC</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">抓拍</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"hw_msg\" class=\"msg\"></p><div id=\"hw_qr_result\"></div><div id=\"hw_camera_preview\" class=\"camview\"></div><pre id=\"hw_out\" class=\"api-log\"></pre></div></section>"
+"<div class=\"box\"><h2>显示</h2><label>显示驱动</label><select id=\"display_driver\" data-cfg><option value=\"ili9488\">ILI9488 SPI</option></select><label>屏幕尺寸</label><select id=\"display_preset\" onchange=\"setDisplayPreset(this.value)\"><option value=\"320x480\">320 x 480</option><option value=\"480x320\">480 x 320</option><option value=\"240x320\">240 x 320</option><option value=\"240x240\">240 x 240</option><option value=\"custom\">自定义</option></select><div class=\"inline\"><input id=\"display_width\" data-cfg type=\"number\" min=\"64\" max=\"1024\"><input id=\"display_height\" data-cfg type=\"number\" min=\"64\" max=\"1024\"></div><label>方向</label><select id=\"display_orientation\" data-cfg><option value=\"portrait\">竖屏</option><option value=\"landscape\">横屏</option></select><label class=\"inline\"><input id=\"display_flip\" data-cfg type=\"checkbox\">翻转 180°</label><label>触摸旋转</label><select id=\"touch_rotation\" data-cfg><option value=\"0\">0°</option><option value=\"1\">90°</option><option value=\"2\">180°</option><option value=\"3\">270°</option></select><label>触摸原始范围</label><div class=\"inline\"><input id=\"touch_raw_width\" data-cfg type=\"number\" min=\"64\" max=\"1024\"><input id=\"touch_raw_height\" data-cfg type=\"number\" min=\"64\" max=\"1024\"></div><label class=\"inline\"><input id=\"touch_swap_xy\" data-cfg type=\"checkbox\">交换触摸 X/Y</label><label class=\"inline\"><input id=\"touch_flip_x\" data-cfg type=\"checkbox\">触摸 X 翻转</label><label class=\"inline\"><input id=\"touch_flip_y\" data-cfg type=\"checkbox\">触摸 Y 翻转</label><label>屏幕亮度 <span id=\"brightness_value\"></span></label><input id=\"display_brightness\" data-cfg type=\"range\" min=\"0\" max=\"100\" step=\"5\" oninput=\"brightness_value.textContent=this.value+'%'\" onchange=\"setBrightness(this.value)\"><label>自动息屏</label><select id=\"screen_sleep_minutes\" data-cfg><option value=\"5\">5 分钟</option><option value=\"10\">10 分钟</option><option value=\"15\">15 分钟</option><option value=\"30\">30 分钟</option><option value=\"60\">60 分钟</option></select></div></div></section>"
+"<section id=\"partdb\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>接口配置</h2><label>Part-DB 地址</label><input id=\"partdb_url\" data-cfg placeholder=\"http://partdb.local 或 http://partdb.local/api\"><label>Part-DB API Token</label><input id=\"partdb_token\" data-cfg type=\"password\"><label>诊断上传地址</label><input id=\"camera_upload_url\" data-cfg placeholder=\"仅用于手动抓图上传诊断\"><button class=\"primary\" onclick=\"savePartdbCfg()\">保存接口</button><button onclick=\"partdbGet('/api/parts.jsonld?itemsPerPage=1')\">测试元件列表</button><button onclick=\"partdbGet('/api/categories.jsonld?itemsPerPage=1')\">测试分类</button><p id=\"partdb_msg\" class=\"msg\"></p><p class=\"muted\">扫码链路只使用 ESP32 本地解码；此地址只给 /api/camera/upload 诊断接口使用。</p><pre id=\"partdb_out\" class=\"api-log\"></pre></div></div></section>"
+"<section id=\"hardware\" class=\"panel\"><div class=\"box\"><h2>硬件诊断</h2><div id=\"hw_cards\" class=\"statusrow\"></div><button class=\"primary\" onclick=\"runHardwareDiag()\">重新诊断</button><button onclick=\"diag('/api/display/test')\">显示测试</button><button onclick=\"diag('/api/touch')\">读取触摸</button><button onclick=\"diag('/api/nfc/read')\">读取 NFC</button><button onclick=\"mountSd()\">挂载 TF</button><button onclick=\"captureCamera()\">预览抓图</button><button class=\"primary\" onclick=\"scanQr()\">扫码</button><p id=\"hw_msg\" class=\"msg\"></p><div id=\"hw_qr_result\"></div><div id=\"hw_camera_preview\" class=\"camview\"></div><pre id=\"hw_out\" class=\"api-log\"></pre></div></section>"
 "<section id=\"resources\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>TF 卡</h2><div class=\"bar\"><i id=\"sd_bar\"></i></div><p id=\"sd_text\" class=\"muted\">未挂载</p><button onclick=\"mountSd()\">挂载/刷新</button><button onclick=\"prepareSd()\">初始化目录</button><button class=\"danger\" onclick=\"formatSd()\">格式化 TF</button><p class=\"muted\">格式化会清空整张卡；固件只把 TF 卡用于缓存、屏保、开机动画和字体。</p></div>"
-"<div class=\"box\"><h2>上传资源</h2><label>资源类型</label><select id=\"asset_kind\" onchange=\"assetKindChanged()\"><option value=\"screen_bg\">屏幕背景图</option><option value=\"boot_anim\">开机动态图片</option><option value=\"lock_bg\">锁屏背景图</option></select><input id=\"asset_file\" type=\"file\" accept=\"image/*\"><label id=\"fit_label\">图片适配</label><select id=\"fit_mode\"><option value=\"contain\">完整显示</option><option value=\"cover\">铺满裁切</option></select><button class=\"primary\" onclick=\"uploadAsset()\">上传</button><p id=\"asset_msg\" class=\"msg\"></p></div></div>"
+"<div class=\"box\"><h2>上传资源</h2><label>资源类型</label><select id=\"asset_kind\" onchange=\"assetKindChanged()\"><option value=\"screen_bg\">屏幕背景图</option><option value=\"boot_image\">静态开机图</option><option value=\"boot_anim\">开机动态图片</option><option value=\"lock_bg\">锁屏背景图</option></select><input id=\"asset_file\" type=\"file\" accept=\"image/*\"><label id=\"fit_label\">图片适配</label><select id=\"fit_mode\"><option value=\"contain\">完整显示</option><option value=\"cover\">铺满裁切</option></select><button class=\"primary\" onclick=\"uploadAsset()\">上传</button><p id=\"asset_msg\" class=\"msg\"></p></div></div>"
 "<div id=\"asset_cards\" class=\"assetgrid\"></div><div class=\"browser\"><div class=\"box\" hidden><h2>文件</h2><div class=\"pathbar\"><button onclick=\"openSd('/')\">根目录</button><button onclick=\"openParent()\">上一级</button><span id=\"sd_path\" class=\"muted\">/</span></div><div id=\"sd_files\" class=\"filegrid\"></div><p id=\"res_msg\" class=\"msg\"></p><pre id=\"res_out\" class=\"api-log\"></pre></div><div class=\"preview\"><h2>预览</h2><div class=\"muted\">boot_image_path</div><p id=\"path_boot\" class=\"muted\"></p><div class=\"muted\">font_dir</div><p id=\"path_font\" class=\"muted\"></p><div class=\"muted\">font_path</div><p id=\"path_font_file\" class=\"muted\"></p><div id=\"file_preview\"></div></div></div></section>"
-"<section id=\"maintenance\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>OTA</h2><input id=\"ota\" type=\"file\"><button class=\"primary\" onclick=\"otaUpload()\">上传固件</button><p id=\"ota_msg\" class=\"msg\"></p></div><div class=\"box\"><h2>项目声明</h2><p id=\"dev_line\" class=\"muted\">-</p><p id=\"repo_line\" class=\"muted\">-</p><pre id=\"api_out\" class=\"api-log\">/api/status\n/api/config\n/api/sd/format\n/api/sd/upload\n/api/partdb/get</pre></div></div></section>"
+"<section id=\"maintenance\" class=\"panel\"><div class=\"grid\"><div class=\"box\"><h2>OTA</h2><input id=\"ota\" type=\"file\"><button class=\"primary\" onclick=\"otaUpload()\">上传固件</button><p id=\"ota_msg\" class=\"msg\"></p></div><div class=\"box\"><h2>项目声明</h2><p id=\"dev_line\" class=\"muted\">-</p><p class=\"muted\">源码仓库：<a id=\"repo_link\" target=\"_blank\" rel=\"noopener noreferrer\">-</a></p><pre id=\"api_out\" class=\"api-log\">/api/status\n/api/config\n/api/sd/format\n/api/sd/upload\n/api/partdb/get</pre></div></div></section>"
 "<section id=\"future\" hidden><button onclick=\"screenPower(false)\">息屏</button><button onclick=\"screenPower(true)\">唤醒</button></section><div id=\"confirm_modal\" class=\"modal hidden\"><div class=\"dialog\"><h2>确认操作</h2><p id=\"confirm_text\" class=\"muted\"></p><button id=\"confirm_ok\" class=\"danger\">确认</button><button id=\"confirm_cancel\">取消</button></div></div>"
 "<script>"
-"let editing=false,loaded=false,lastConfig={};const cfgFields=['device_name','wifi_ssid','partdb_url','font_path','display_driver','display_orientation','display_width','display_height','touch_rotation','touch_raw_width','touch_raw_height'];"
+"let editing=false,loaded=false,lastConfig={};const cfgFields=['device_name','wifi_ssid','partdb_url','camera_upload_url','font_path','display_driver','display_orientation','display_width','display_height','touch_rotation','touch_raw_width','touch_raw_height','screen_sleep_minutes'];"
 "function $(id){return document.getElementById(id)}function say(t){$('msg').textContent=t||''}function tab(id){document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===id));document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===id))}"
 "async function j(u,o){let r=await fetch(u,o),t=await r.text(),d={};try{d=t?JSON.parse(t):{}}catch(e){d={ok:false,err:t||('HTTP '+r.status)}}if(!r.ok&&d.ok!==false){d.ok=false;d.err=d.err||('HTTP '+r.status)}d.http_status=r.status;return d}document.addEventListener('input',e=>{if(e.target&&e.target.dataset.cfg!==undefined)editing=true;if(e.target&&(e.target.id==='display_width'||e.target.id==='display_height'))syncDisplayPreset()});"
 "function syncDisplayPreset(){let p=$('display_preset'),v=($('display_width').value||'')+'x'+($('display_height').value||''),found=false;Array.from(p.options).forEach(o=>{if(o.value===v)found=true});p.value=found?v:'custom'}function setDisplayPreset(v){if(v==='custom')return;let a=v.split('x');$('display_width').value=a[0];$('display_height').value=a[1];editing=true}"
@@ -123,12 +143,12 @@ static const char INDEX_HTML[] =
 "function fmtMB(n){return n>=1024?(n/1024).toFixed(1)+' GB':Number(n||0).toFixed(1)+' MB'}function renderSd(sd){sd=sd||{};let total=sd.total_mb||sd.card_size_mb||0,free=sd.free_mb||0,used=Math.max(0,total-free),pct=total?Math.min(100,used*100/total):0;$('sd_bar').style.width=pct+'%';$('sd_text').textContent=sd.mounted?('已挂载 '+fmtMB(free)+' 可用 / '+fmtMB(total)+' 总容量'):'未挂载';$('m_tf').textContent=sd.mounted?fmtMB(free)+' 可用':'未挂载'}"
 "function item(label,it){it=it||{};let cls=it.ok?'ok':(it.err==='ESP_ERR_INVALID_STATE'?'wait':'bad'),txt=it.ok?'正常':(it.err==='ESP_ERR_INVALID_STATE'?'检测中':'异常');return `<div class=\"statusitem\"><b>${label}</b><span class=\"${cls}\">${txt}</span></div>`}"
 "function renderHw(h){h=h||{};let d=h.diagnostics||{},html=item('显示屏',d.display)+item('触摸',d.touch)+item('NFC',d.nfc)+item('TF 卡',d.tf)+item('相机',d.camera);$('hw_cards').innerHTML=html;let vals=[d.display,d.touch,d.nfc,d.tf,d.camera].filter(Boolean),ok=vals.filter(x=>x.ok).length,bad=vals.filter(x=>x.err&&x.err!=='ESP_OK'&&x.err!=='ESP_ERR_INVALID_STATE').length;$('m_hw').textContent=d.running?'诊断中':(ok+' 正常 / '+bad+' 异常');return html}"
-"function renderStatus(s){$('status').textContent=JSON.stringify(s,null,2);$('device_title').textContent=s.device_name||'Part-DB Terminal';$('headline').textContent=(s.wifi&&s.wifi.ip)?('STA '+s.wifi.ip):'AP 192.168.4.1';$('m_wifi').textContent=s.wifi&&s.wifi.sta_connected?s.wifi.ip:'未连接';$('m_ap').textContent=s.wifi&&s.wifi.ap_started?'已开启':'关闭';$('m_partdb').textContent=s.partdb&&s.partdb.configured?(s.partdb.last_ok?'在线':'已配置'):'未配置';renderSd(s.sd);let hw=renderHw(s.hardware);$('status_cards').innerHTML=item('WiFi',{ok:s.wifi&&s.wifi.sta_connected,err:s.wifi&&s.wifi.sta_connected?'ESP_OK':'ESP_FAIL'})+item('Part-DB',{ok:s.partdb&&s.partdb.configured,err:s.partdb&&s.partdb.configured?'ESP_OK':'ESP_FAIL'})+item('TF 卡',{ok:s.sd&&s.sd.mounted,err:s.sd&&s.sd.mounted?'ESP_OK':'ESP_FAIL'})+hw;let a=s.about||{};$('dev_line').textContent='开发者：'+(a.developer||'-');$('repo_line').textContent=a.source_repo_reserved?'源码仓库：预留':'源码仓库：'+a.source_repo_url}"
-"async function loadStatus(){renderStatus(await j('/api/status'))}async function loadAll(){await loadConfig();await loadFonts();assetKindChanged();await loadStatus();await loadAssets()}async function savePartialConfig(body){return await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}async function saveCfg(){let body={};['device_name','wifi_ssid','wifi_pass','partdb_url','partdb_token','font_path','display_driver','display_orientation'].forEach(k=>body[k]=$(k).value);body.ap_enabled=$('ap_enabled').checked;body.display_flip=$('display_flip').checked;body.touch_rotation=Number($('touch_rotation').value)||0;body.touch_swap_xy=$('touch_swap_xy').checked;body.touch_flip_x=$('touch_flip_x').checked;body.touch_flip_y=$('touch_flip_y').checked;body.display_brightness=Number($('display_brightness').value);body.display_width=Number($('display_width').value)||320;body.display_height=Number($('display_height').value)||480;body.touch_raw_width=Number($('touch_raw_width').value)||320;body.touch_raw_height=Number($('touch_raw_height').value)||480;let r=await savePartialConfig(body);say(r.ok?'已保存，正在重连':'保存失败 '+r.err);editing=false;loaded=false;$('wifi_pass').value='';$('partdb_token').value='';setTimeout(loadAll,900)}"
+"function renderStatus(s){$('status').textContent=JSON.stringify(s,null,2);$('device_title').textContent=s.device_name||'Part-DB Terminal';$('headline').textContent=(s.wifi&&s.wifi.ip)?('STA '+s.wifi.ip):'AP 192.168.4.1';$('m_wifi').textContent=s.wifi&&s.wifi.sta_connected?s.wifi.ip:'未连接';$('m_ap').textContent=s.wifi&&s.wifi.ap_started?'已开启':'关闭';$('m_partdb').textContent=s.partdb&&s.partdb.configured?(s.partdb.last_ok?'在线':'已配置'):'未配置';renderSd(s.sd);let hw=renderHw(s.hardware);$('status_cards').innerHTML=item('WiFi',{ok:s.wifi&&s.wifi.sta_connected,err:s.wifi&&s.wifi.sta_connected?'ESP_OK':'ESP_FAIL'})+item('Part-DB',{ok:s.partdb&&s.partdb.configured,err:s.partdb&&s.partdb.configured?'ESP_OK':'ESP_FAIL'})+item('TF 卡',{ok:s.sd&&s.sd.mounted,err:s.sd&&s.sd.mounted?'ESP_OK':'ESP_FAIL'})+hw;let a=s.about||{},u=a.source_repo_reserved?'':(a.source_repo_url||''),l=$('repo_link');$('dev_line').textContent='开发者：'+(a.developer||'-');l.textContent=u||'未填写';if(u)l.href=u;else l.removeAttribute('href')}"
+"async function loadStatus(){renderStatus(await j('/api/status'))}async function loadAll(){await loadConfig();await loadFonts();assetKindChanged();await loadStatus();await loadAssets()}async function savePartialConfig(body){return await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}async function saveCfg(){let body={};['device_name','wifi_ssid','wifi_pass','partdb_url','partdb_token','camera_upload_url','font_path','display_driver','display_orientation'].forEach(k=>body[k]=$(k).value);body.ap_enabled=$('ap_enabled').checked;body.display_flip=$('display_flip').checked;body.touch_rotation=Number($('touch_rotation').value)||0;body.touch_swap_xy=$('touch_swap_xy').checked;body.touch_flip_x=$('touch_flip_x').checked;body.touch_flip_y=$('touch_flip_y').checked;body.display_brightness=Number($('display_brightness').value);body.screen_sleep_minutes=Number($('screen_sleep_minutes').value)||5;body.display_width=Number($('display_width').value)||320;body.display_height=Number($('display_height').value)||480;body.touch_raw_width=Number($('touch_raw_width').value)||320;body.touch_raw_height=Number($('touch_raw_height').value)||480;let r=await savePartialConfig(body);say(r.ok?'已保存，正在重连':'保存失败 '+r.err);editing=false;loaded=false;$('wifi_pass').value='';$('partdb_token').value='';setTimeout(loadAll,900)}"
 "async function saveResourceCfg(){let body={font_path:$('font_path').value};let r=await savePartialConfig(body);$('font_msg').textContent=r.ok?'字体设置已保存':'保存失败 '+r.err;editing=false;loaded=false;await loadConfig();await loadFonts()}"
 "async function setBrightness(v){$('brightness_value').textContent=v+'%';await j('/api/display/brightness',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_brightness:Number(v)})});loadStatus()}async function enableAp(){let r=await j('/api/wifi/ap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true})});say(r.ok?'AP 已开启':'开启 AP 失败 '+r.err);loadStatus()}"
-"async function screenPower(awake){await j('/api/display/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({awake:!!awake})});loadStatus()}async function diag(u){let r=await j(u);$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok===false?('执行失败 '+r.err):'已执行，详细日志看串口';loadStatus()}async function runHardwareDiag(){$('hw_msg').textContent='正在诊断...';let r=await j('/api/hardware/diagnose',{method:'POST'});$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok?'诊断完成':'诊断失败 '+r.err;loadStatus()}function renderQr(r){r=r||{};let found=!!r.found,meta=(r.width||0)+'x'+(r.height||0)+' · '+(r.elapsed_ms||0)+' ms · '+(r.err||'');let html='<div class=\"scanbox\"><b>'+(found?'识别到二维码':'未识别到二维码')+'</b>'+(found?'<code>'+esc(r.text||'')+'</code>':'')+'<div class=\"muted\">'+esc(meta)+'</div></div>';$('qr_result').innerHTML=html;$('hw_qr_result').innerHTML=html}async function scanQr(){say('正在扫码...');$('hw_msg').textContent='正在扫码...';try{let r=await j('/api/camera/scan',{method:'POST'});renderQr(r);let msg=r.found?'扫码成功':(r.ok?'未识别到二维码':'扫码失败 '+r.err);say(msg);$('hw_msg').textContent=msg}catch(e){say('扫码失败 '+e.message);$('hw_msg').textContent='扫码失败 '+e.message}loadStatus()}async function captureCamera(){say('正在抓拍...');$('hw_msg').textContent='正在抓拍...';try{let r=await fetch('/api/camera.jpg?t='+Date.now());if(!r.ok)throw new Error('HTTP '+r.status);let b=await r.blob(),u=URL.createObjectURL(b);if(window.cameraUrl)URL.revokeObjectURL(window.cameraUrl);window.cameraUrl=u;let html='<img src=\"'+u+'\" alt=\"camera\">';$('camera_preview').innerHTML=html;$('hw_camera_preview').innerHTML=html;say('抓拍已刷新');$('hw_msg').textContent='抓拍已刷新'}catch(e){say('抓拍失败 '+e.message);$('hw_msg').textContent='抓拍失败 '+e.message}loadStatus()}async function otaUpload(){let f=$('ota').files[0];if(!f){$('ota_msg').textContent='请选择固件';return}let r=await fetch('/api/ota',{method:'POST',body:f});$('ota_msg').textContent=await r.text()}"
-"async function savePartdbCfg(){let body={partdb_url:$('partdb_url').value,partdb_token:$('partdb_token').value};let r=await savePartialConfig(body);$('partdb_msg').textContent=r.ok?'接口已保存':'保存失败 '+r.err;$('partdb_token').value='';editing=false;loaded=false;loadStatus()}async function partdbGet(path){let r=await j('/api/partdb/get',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path})});$('partdb_out').textContent=JSON.stringify(r,null,2);$('partdb_msg').textContent=r.ok?'测试通过，详细响应看串口':'测试失败 HTTP '+(r.http_status||0)+' '+r.err;loadStatus()}"
+"async function screenPower(awake){await j('/api/display/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({awake:!!awake})});loadStatus()}async function diag(u){let r=await j(u);$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok===false?('执行失败 '+r.err):'已执行，详细日志看串口';loadStatus()}async function runHardwareDiag(){$('hw_msg').textContent='正在诊断...';let r=await j('/api/hardware/diagnose',{method:'POST'});$('hw_out').textContent=JSON.stringify(r,null,2);$('hw_msg').textContent=r.ok?'诊断完成':'诊断失败 '+r.err;loadStatus()}function renderQr(r){r=r||{};let found=!!r.found,meta=(r.width||0)+'x'+(r.height||0)+' · '+(r.elapsed_ms||0)+' ms · '+(r.err||'');let html='<div class=\"scanbox\"><b>'+(found?'识别到二维码':'未识别到二维码')+'</b>'+(found?'<code>'+esc(r.text||'')+'</code>':'')+'<div class=\"muted\">'+esc(meta)+'</div></div>';$('qr_result').innerHTML=html;$('hw_qr_result').innerHTML=html}async function scanQr(){say('正在扫码...');$('hw_msg').textContent='正在扫码...';try{let r=await j('/api/camera/scan',{method:'POST'});renderQr(r);let msg=r.found?'扫码成功':(r.ok?'未识别到二维码':'扫码失败 '+r.err);say(msg);$('hw_msg').textContent=msg}catch(e){say('扫码失败 '+e.message);$('hw_msg').textContent='扫码失败 '+e.message}loadStatus()}async function captureCamera(){say('正在获取预览...');$('hw_msg').textContent='正在获取预览...';try{let r=await fetch('/api/camera.jpg?t='+Date.now());if(!r.ok)throw new Error('HTTP '+r.status);let b=await r.blob(),u=URL.createObjectURL(b);if(window.cameraUrl)URL.revokeObjectURL(window.cameraUrl);window.cameraUrl=u;let html='<img src=\"'+u+'\" alt=\"camera\">';$('camera_preview').innerHTML=html;$('hw_camera_preview').innerHTML=html;say('预览已刷新');$('hw_msg').textContent='预览已刷新'}catch(e){say('预览失败 '+e.message);$('hw_msg').textContent='预览失败 '+e.message}loadStatus()}async function otaUpload(){let f=$('ota').files[0];if(!f){$('ota_msg').textContent='请选择固件';return}let r=await fetch('/api/ota',{method:'POST',body:f});$('ota_msg').textContent=await r.text()}"
+"async function savePartdbCfg(){let body={partdb_url:$('partdb_url').value,partdb_token:$('partdb_token').value,camera_upload_url:$('camera_upload_url').value};let r=await savePartialConfig(body);$('partdb_msg').textContent=r.ok?'接口已保存':'保存失败 '+r.err;$('partdb_token').value='';editing=false;loaded=false;loadStatus()}async function partdbGet(path){let r=await j('/api/partdb/get',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path})});$('partdb_out').textContent=JSON.stringify(r,null,2);$('partdb_msg').textContent=r.ok?'测试通过，详细响应看串口':'测试失败 HTTP '+(r.http_status||0)+' '+r.err;loadStatus()}"
 "function fontSelectionChanged(){let p=$('font_path').value;$('font_delete').disabled=!p;$('path_font_file').textContent=p||'默认内置字体'}"
 "async function loadFonts(){let sel=$('font_path'),cur=lastConfig.font_path||sel.value||'';try{let r=await j('/api/fonts/list');let html='<option value=\"\">默认内置字体</option>';(r.entries||[]).forEach(e=>{html+='<option value=\"'+esc(e.path)+'\">'+esc(e.name)+' · '+fmt(e.size)+'</option>'});sel.innerHTML=html;sel.value=cur;if(sel.value!==cur)sel.value='';fontSelectionChanged();$('font_count').textContent=r.ok?((r.count||0)+' 个字体文件'):'读取字体目录失败 '+r.err}catch(e){$('font_count').textContent='读取字体目录失败 '+e.message;fontSelectionChanged()}}"
 "async function uploadFont(){let f=$('font_file').files[0];if(!f){$('font_msg').textContent='请选择字体文件';return}let n=f.name.toLowerCase();if(!(/\\.(ttf|otf|ttc|woff|woff2)$/.test(n))){$('font_msg').textContent='字体只支持 TTF/OTF/TTC/WOFF/WOFF2';return}$('font_msg').textContent='正在上传字体 '+fmt(f.size)+'，请等待';try{let r=await j('/api/fonts/upload?name='+encodeURIComponent(f.name),{method:'POST',body:f});$('res_out').textContent=JSON.stringify(r,null,2);if(r.ok){lastConfig.font_path=r.path;await loadFonts();$('font_path').value=r.path;fontSelectionChanged();editing=true;$('font_msg').textContent='已上传 '+r.path+'，大小 '+fmt(r.size)+'，点击保存字体设置生效'}else{$('font_msg').textContent='上传失败 '+(r.err||('HTTP '+(r.http_status||0)))}}catch(e){$('font_msg').textContent='上传失败 '+e.message}}"
@@ -137,7 +157,7 @@ static const char INDEX_HTML[] =
 "async function mountSd(){let r=await j('/api/sd/mount');$('res_out').textContent=JSON.stringify(r,null,2);$('res_msg').textContent=r.ok?'TF 已挂载':'TF 挂载失败 '+r.err;renderSd(r);await openSd(sdPath);await loadAssets();loadStatus()}async function prepareSd(){let r=await j('/api/sd/prepare',{method:'POST'});$('res_out').textContent=JSON.stringify(r,null,2);$('res_msg').textContent=r.ok?'目录已初始化':'初始化失败 '+r.err;renderSd(r);await openSd('/');await loadAssets();loadStatus()}async function formatSd(){if(!confirm('格式化会清空整张 TF 卡。继续？'))return;let r=await j('/api/sd/format',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'FORMAT'})});$('res_out').textContent=JSON.stringify(r,null,2);$('res_msg').textContent=r.ok?'TF 已格式化':'格式化失败 '+r.err;renderSd(r);await openSd('/');await loadAssets();loadStatus()}async function openParent(){if(sdPath==='/'||!sdPath)return;let p=sdPath.endsWith('/')?sdPath.slice(0,-1):sdPath;p=p.substring(0,p.lastIndexOf('/'))||'/';openSd(p)}"
 "async function openSd(p){sdPath=p||'/';$('sd_path').textContent=sdPath;let r=await j('/api/sd/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:sdPath})});$('res_out').textContent=JSON.stringify({ok:r.ok,err:r.err,path:r.path,total_mb:r.total_mb,free_mb:r.free_mb},null,2);if(!r.ok){$('res_msg').textContent='读取目录失败 '+r.err}renderSd(r);let html='';(r.entries||[]).forEach(e=>{let ico=e.dir?'DIR':(e.type==='image'?'IMG':(e.type==='text'?'TXT':'FILE'));let act=e.dir?`openSd(${JSON.stringify(e.path)})`:`previewFile(${JSON.stringify(e.path)},${JSON.stringify(e.type)})`;html+=`<button class=\"file\" onclick=\"${act}\"><span class=\"ico\">${ico}</span><span class=\"name\">${esc(e.name)}</span><span class=\"meta\">${e.dir?'目录':fmt(e.size)}</span></button>`});$('sd_files').innerHTML=html||'<div class=\"muted\">没有文件</div>'}"
 "async function previewFile(p,t){let u='/api/sd/file?path='+encodeURIComponent(p);if(t==='image'){$('file_preview').innerHTML='<img src=\"'+u+'\"><p class=\"muted\">'+esc(p)+'</p>'}else if(t==='text'){let txt=await(await fetch(u)).text();$('file_preview').innerHTML='<pre class=\"result\">'+esc(txt.slice(0,4096))+'</pre>'}else{$('file_preview').innerHTML='<p>'+esc(p)+'</p><a href=\"'+u+'\" target=\"_blank\">下载/打开</a>'}}"
-"const assetKinds=[{kind:'screen_bg',label:'屏幕背景图'},{kind:'boot_anim',label:'开机动态图片'},{kind:'lock_bg',label:'锁屏背景图'}];let pendingConfirm=null;"
+"const assetKinds=[{kind:'screen_bg',label:'屏幕背景图'},{kind:'boot_image',label:'静态开机图'},{kind:'boot_anim',label:'开机动态图片'},{kind:'lock_bg',label:'锁屏背景图'}];let pendingConfirm=null;"
 "function safeName(n){return String(n||'asset').replace(/\\.[^.]*$/,'').replace(/[^A-Za-z0-9_-]+/g,'_').slice(0,40)||'asset'}function loadImg(f){return new Promise((ok,fail)=>{let u=URL.createObjectURL(f),im=new Image();im.onload=()=>{URL.revokeObjectURL(u);ok(im)};im.onerror=fail;im.src=u})}"
 "function assetKindChanged(){let boot=$('asset_kind').value==='boot_anim';$('asset_file').accept=boot?'image/gif,image/webp':'image/*';$('fit_label').style.display=boot?'none':'block';$('fit_mode').style.display=boot?'none':'block';$('asset_msg').textContent=boot?'开机动态图片只保存 GIF/WebP，限 1 份':''}"
 "function showConfirm(text,cb){pendingConfirm=cb;$('confirm_text').textContent=text;$('confirm_modal').classList.remove('hidden')}function closeConfirm(){pendingConfirm=null;$('confirm_modal').classList.add('hidden')}"
@@ -180,6 +200,44 @@ static bool read_body(httpd_req_t *req, char *buf, size_t buf_len)
     }
     buf[done] = '\0';
     return true;
+}
+
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:
+        return "POWERON";
+    case ESP_RST_EXT:
+        return "EXT";
+    case ESP_RST_SW:
+        return "SW";
+    case ESP_RST_PANIC:
+        return "PANIC";
+    case ESP_RST_INT_WDT:
+        return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+        return "TASK_WDT";
+    case ESP_RST_WDT:
+        return "WDT";
+    case ESP_RST_DEEPSLEEP:
+        return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT";
+    case ESP_RST_SDIO:
+        return "SDIO";
+    case ESP_RST_USB:
+        return "USB";
+    case ESP_RST_JTAG:
+        return "JTAG";
+    case ESP_RST_EFUSE:
+        return "EFUSE";
+    case ESP_RST_PWR_GLITCH:
+        return "PWR_GLITCH";
+    case ESP_RST_CPU_LOCKUP:
+        return "CPU_LOCKUP";
+    default:
+        return "UNKNOWN";
+    }
 }
 
 static bool hex_digit(char c, uint8_t *out)
@@ -406,26 +464,6 @@ static bool json_string_copy(cJSON *root, const char *key, char *out, size_t out
     return true;
 }
 
-static bool parse_positive_int(const char *s, int *out)
-{
-    if (!s || !isdigit((unsigned char)*s) || !out) {
-        return false;
-    }
-    long value = 0;
-    while (isdigit((unsigned char)*s)) {
-        value = value * 10 + (*s - '0');
-        if (value > 99999999) {
-            return false;
-        }
-        s++;
-    }
-    if (value <= 0) {
-        return false;
-    }
-    *out = (int)value;
-    return true;
-}
-
 static bool parse_barcode_int(const char *s, int *out)
 {
     if (!s || !isdigit((unsigned char)*s) || !out) {
@@ -456,7 +494,22 @@ static bool parse_id_after_marker(const char *text, const char *marker, int *id)
         return false;
     }
     p += strlen(marker);
-    return parse_positive_int(p, id);
+    if (!isdigit((unsigned char)*p) || !id) {
+        return false;
+    }
+    long value = 0;
+    while (isdigit((unsigned char)*p)) {
+        value = value * 10 + (*p - '0');
+        if (value > 99999999) {
+            return false;
+        }
+        p++;
+    }
+    if (value <= 0) {
+        return false;
+    }
+    *id = (int)value;
+    return true;
 }
 
 static bool target_set(partdb_barcode_target_t *target, char prefix, int id)
@@ -508,10 +561,40 @@ static bool target_from_barcode(const char *barcode, partdb_barcode_target_t *ta
     if (parse_id_after_marker(barcode, "/scan/part/", &id)) {
         return target_set(target, 'P', id);
     }
+    if (parse_id_after_marker(barcode, "/p/", &id)) {
+        return target_set(target, 'P', id);
+    }
+    if (parse_id_after_marker(barcode, "/part/", &id)) {
+        return target_set(target, 'P', id);
+    }
     if (parse_id_after_marker(barcode, "/scan/lot/", &id)) {
         return target_set(target, 'L', id);
     }
+    if (parse_id_after_marker(barcode, "/l/", &id)) {
+        return target_set(target, 'L', id);
+    }
+    if (parse_id_after_marker(barcode, "/lot/", &id)) {
+        return target_set(target, 'L', id);
+    }
     if (parse_id_after_marker(barcode, "/scan/location/", &id)) {
+        return target_set(target, 'S', id);
+    }
+    if (parse_id_after_marker(barcode, "/s/", &id)) {
+        return target_set(target, 'S', id);
+    }
+    if (parse_id_after_marker(barcode, "/location/", &id)) {
+        return target_set(target, 'S', id);
+    }
+    if ((barcode[0] == 'p' || barcode[0] == 'P') && barcode[1] == '/' &&
+        parse_barcode_int(barcode + 2, &id)) {
+        return target_set(target, 'P', id);
+    }
+    if ((barcode[0] == 'l' || barcode[0] == 'L') && barcode[1] == '/' &&
+        parse_barcode_int(barcode + 2, &id)) {
+        return target_set(target, 'L', id);
+    }
+    if ((barcode[0] == 's' || barcode[0] == 'S') && barcode[1] == '/' &&
+        parse_barcode_int(barcode + 2, &id)) {
         return target_set(target, 'S', id);
     }
     char prefix = (char)toupper((unsigned char)barcode[0]);
@@ -523,17 +606,21 @@ static bool target_from_barcode(const char *barcode, partdb_barcode_target_t *ta
 
 static bool target_from_partdb_path(const char *path, partdb_barcode_target_t *target)
 {
-    if (!path || !target || strstr(path, "://")) {
+    if (!path || !target) {
         return false;
     }
     int id = 0;
-    if (parse_id_after_marker(path, "/parts/", &id)) {
+    if (parse_id_after_marker(path, "/parts/", &id) ||
+        parse_id_after_marker(path, "/part/", &id)) {
         return target_set(target, 'P', id);
     }
-    if (parse_id_after_marker(path, "/part_lots/", &id)) {
+    if (parse_id_after_marker(path, "/part_lots/", &id) ||
+        parse_id_after_marker(path, "/lot/", &id)) {
         return target_set(target, 'L', id);
     }
-    if (parse_id_after_marker(path, "/storage_locations/", &id)) {
+    if (parse_id_after_marker(path, "/storage_locations/", &id) ||
+        parse_id_after_marker(path, "/storage_location/", &id) ||
+        parse_id_after_marker(path, "/location/", &id)) {
         return target_set(target, 'S', id);
     }
     return false;
@@ -567,6 +654,24 @@ static bool url_encode_component(const char *in, char *out, size_t out_len)
     }
     out[w] = '\0';
     return true;
+}
+
+static void bytes_to_hex_string(const uint8_t *data, size_t len, char *out, size_t out_len)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!data) {
+        return;
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < len && w + 2 < out_len; i++) {
+        out[w++] = hex[data[i] >> 4];
+        out[w++] = hex[data[i] & 0x0f];
+    }
+    out[w] = '\0';
 }
 
 static bool target_from_user_barcode_lookup(cJSON *root, const char *barcode,
@@ -1048,6 +1153,9 @@ static char *selected_asset_path_mut(const asset_kind_t *kind)
     if (strcmp(kind->kind, "screen_bg") == 0) {
         return s_cfg->screen_bg_path;
     }
+    if (strcmp(kind->kind, "boot_image") == 0) {
+        return s_cfg->boot_image_path;
+    }
     if (strcmp(kind->kind, "boot_anim") == 0) {
         return s_cfg->boot_anim_path;
     }
@@ -1220,12 +1328,14 @@ static esp_err_t config_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "wifi_pass_set", s_cfg->wifi_pass[0] != '\0');
     cJSON_AddStringToObject(root, "partdb_url", s_cfg->partdb_url);
     cJSON_AddStringToObject(root, "partdb_token", "");
+    cJSON_AddStringToObject(root, "camera_upload_url", s_cfg->camera_upload_url);
     cJSON_AddStringToObject(root, "boot_image_path", s_cfg->boot_image_path);
     cJSON_AddStringToObject(root, "font_dir", s_cfg->font_dir);
     cJSON_AddStringToObject(root, "font_path", s_cfg->font_path);
     cJSON_AddStringToObject(root, "screen_bg_path", s_cfg->screen_bg_path);
     cJSON_AddStringToObject(root, "boot_anim_path", s_cfg->boot_anim_path);
     cJSON_AddStringToObject(root, "lock_bg_path", s_cfg->lock_bg_path);
+    cJSON_AddStringToObject(root, "ui_language", s_cfg->ui_language);
     cJSON_AddStringToObject(root, "display_driver", s_cfg->display_driver);
     cJSON_AddStringToObject(root, "display_orientation", s_cfg->display_orientation);
     cJSON_AddBoolToObject(root, "display_flip", s_cfg->display_flip);
@@ -1239,7 +1349,9 @@ static esp_err_t config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "touch_raw_height", s_cfg->touch_raw_height);
     cJSON_AddBoolToObject(root, "ap_enabled", s_cfg->ap_enabled);
     cJSON_AddBoolToObject(root, "wifi_provisioned", s_cfg->wifi_provisioned);
+    cJSON_AddBoolToObject(root, "nfc_read_confirm", s_cfg->nfc_read_confirm);
     cJSON_AddNumberToObject(root, "display_brightness", s_cfg->display_brightness);
+    cJSON_AddNumberToObject(root, "screen_sleep_minutes", s_cfg->screen_sleep_minutes);
     esp_err_t err = send_json(req, root);
     cJSON_Delete(root);
     return err;
@@ -1280,6 +1392,17 @@ static void cfg_update_u8(cJSON *root, const char *key, uint8_t *dst, uint8_t ma
     *dst = (uint8_t)value;
 }
 
+static uint8_t cfg_normalize_sleep_minutes(uint8_t minutes)
+{
+    static const uint8_t allowed[] = {5, 10, 15, 30, 60};
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (minutes <= allowed[i]) {
+            return allowed[i];
+        }
+    }
+    return allowed[sizeof(allowed) / sizeof(allowed[0]) - 1];
+}
+
 static void cfg_update_u16(cJSON *root, const char *key, uint16_t *dst, uint16_t min_value, uint16_t max_value)
 {
     cJSON *item = cJSON_GetObjectItem(root, key);
@@ -1315,9 +1438,12 @@ static esp_err_t config_post(httpd_req_t *req)
 
     bool wifi_changed = json_has(root, "wifi_ssid") || json_has(root, "wifi_pass") ||
                         json_has(root, "ap_enabled");
-    bool partdb_changed = json_has(root, "partdb_url") || json_has(root, "partdb_token");
+    bool partdb_changed = json_has(root, "partdb_url") || json_has(root, "partdb_token") ||
+                          json_has(root, "camera_upload_url");
     bool font_changed = json_has(root, "font_path");
+    bool language_changed = json_has(root, "ui_language");
     bool brightness_changed = json_has(root, "display_brightness");
+    bool sleep_changed = json_has(root, "screen_sleep_minutes");
     bool display_cfg_changed = json_has(root, "display_driver") || json_has(root, "display_orientation") ||
                                json_has(root, "display_flip") || json_has(root, "display_width") ||
                                json_has(root, "display_height");
@@ -1330,13 +1456,22 @@ static esp_err_t config_post(httpd_req_t *req)
     cfg_update_string(root, "wifi_pass", s_cfg->wifi_pass, sizeof(s_cfg->wifi_pass), false);
     cfg_update_string(root, "partdb_url", s_cfg->partdb_url, sizeof(s_cfg->partdb_url), true);
     cfg_update_string(root, "partdb_token", s_cfg->partdb_token, sizeof(s_cfg->partdb_token), false);
-    app_config_copy_string(s_cfg->boot_image_path, sizeof(s_cfg->boot_image_path), BOARD_SD_BOOT_DIR "/boot.jpg");
+    cfg_update_string(root, "camera_upload_url", s_cfg->camera_upload_url,
+                      sizeof(s_cfg->camera_upload_url), true);
+    if (s_cfg->boot_image_path[0] == '\0') {
+        app_config_copy_string(s_cfg->boot_image_path, sizeof(s_cfg->boot_image_path), BOARD_SD_BOOT_DIR "/boot.jpg");
+    }
     app_config_copy_string(s_cfg->font_dir, sizeof(s_cfg->font_dir), BOARD_SD_FONT_DIR);
     cfg_update_string(root, "font_path", s_cfg->font_path, sizeof(s_cfg->font_path), true);
     if (!font_path_allowed(s_cfg->font_path)) {
         s_cfg->font_path[0] = '\0';
     }
+    cfg_update_string(root, "ui_language", s_cfg->ui_language, sizeof(s_cfg->ui_language), false);
+    app_config_copy_string(s_cfg->ui_language, sizeof(s_cfg->ui_language), "zh-CN");
     cfg_update_string(root, "display_driver", s_cfg->display_driver, sizeof(s_cfg->display_driver), false);
+    if (strcmp(s_cfg->display_driver, "ili9488") != 0) {
+        app_config_copy_string(s_cfg->display_driver, sizeof(s_cfg->display_driver), "ili9488");
+    }
     cfg_update_string(root, "display_orientation", s_cfg->display_orientation, sizeof(s_cfg->display_orientation), false);
     if (strcmp(s_cfg->display_orientation, "landscape") != 0) {
         app_config_copy_string(s_cfg->display_orientation, sizeof(s_cfg->display_orientation), "portrait");
@@ -1346,7 +1481,10 @@ static esp_err_t config_post(httpd_req_t *req)
     cfg_update_bool(root, "touch_swap_xy", &s_cfg->touch_swap_xy);
     cfg_update_bool(root, "touch_flip_x", &s_cfg->touch_flip_x);
     cfg_update_bool(root, "touch_flip_y", &s_cfg->touch_flip_y);
+    cfg_update_bool(root, "nfc_read_confirm", &s_cfg->nfc_read_confirm);
     cfg_update_u8(root, "display_brightness", &s_cfg->display_brightness, 100);
+    cfg_update_u8(root, "screen_sleep_minutes", &s_cfg->screen_sleep_minutes, 60);
+    s_cfg->screen_sleep_minutes = cfg_normalize_sleep_minutes(s_cfg->screen_sleep_minutes);
     cfg_update_u8(root, "touch_rotation", &s_cfg->touch_rotation, 3);
     cfg_update_u16(root, "display_width", &s_cfg->display_width, 64, 1024);
     cfg_update_u16(root, "display_height", &s_cfg->display_height, 64, 1024);
@@ -1369,6 +1507,12 @@ static esp_err_t config_post(httpd_req_t *req)
             (void)device_ui_request_redraw();
         }
         if (touch_cfg_changed) {
+            (void)device_ui_request_redraw();
+        }
+        if (language_changed) {
+            (void)device_ui_request_redraw();
+        }
+        if (sleep_changed) {
             (void)device_ui_request_redraw();
         }
         if (brightness_changed) {
@@ -1433,6 +1577,9 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(jp, "last_http_status", partdb.last_http_status);
     cJSON_AddNumberToObject(jp, "last_response_len", (double)partdb.last_response_len);
     cJSON *hw = cJSON_AddObjectToObject(root, "hardware");
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    cJSON_AddNumberToObject(hw, "reset_reason", reset_reason);
+    cJSON_AddStringToObject(hw, "reset_reason_name", reset_reason_name(reset_reason));
     cJSON_AddBoolToObject(hw, "display_ready", display_ili9488_is_ready());
     cJSON_AddBoolToObject(hw, "display_awake", display_ili9488_is_awake());
     cJSON_AddNumberToObject(hw, "display_brightness", display_ili9488_get_brightness());
@@ -1450,18 +1597,65 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(hw, "touch_ready", touch_ft6336_is_ready());
     cJSON_AddBoolToObject(hw, "nfc_ready", nfc_pn532_is_ready());
     cJSON_AddBoolToObject(hw, "camera_active", camera_mgr_is_active());
+    cJSON_AddBoolToObject(hw, "camera_keep_online", camera_mgr_should_keep_online());
+    cJSON *jmem = cJSON_AddObjectToObject(hw, "memory");
+    cJSON_AddNumberToObject(jmem, "psram_chip_size", esp_psram_get_size());
+    cJSON_AddNumberToObject(jmem, "psram_total", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(jmem, "psram_free", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(jmem, "internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    cJSON_AddNumberToObject(jmem, "internal_largest",
+                            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     cJSON *ji2c = cJSON_AddObjectToObject(hw, "i2c");
-    cJSON_AddStringToObject(ji2c, "touch_backend", "hardware");
-    cJSON_AddNumberToObject(ji2c, "touch_sda_gpio", BOARD_I2C_SDA_GPIO);
-    cJSON_AddNumberToObject(ji2c, "touch_scl_gpio", BOARD_I2C_SCL_GPIO);
+    cJSON_AddStringToObject(ji2c, "touch_backend",
+                            BOARD_TOUCH_USE_SOFT_I2C ? "software" : "hardware");
+    cJSON_AddNumberToObject(ji2c, "touch_sda_gpio", BOARD_TOUCH_SDA_GPIO);
+    cJSON_AddNumberToObject(ji2c, "touch_scl_gpio", BOARD_TOUCH_SCL_GPIO);
     cJSON_AddNumberToObject(ji2c, "touch_addr", BOARD_TOUCH_FT6336_ADDR);
     cJSON_AddStringToObject(ji2c, "nfc_backend", nfc_i2c_backend());
-    cJSON_AddNumberToObject(ji2c, "nfc_sda_gpio", BOARD_NFC_SOFT_SDA_GPIO);
-    cJSON_AddNumberToObject(ji2c, "nfc_scl_gpio", BOARD_NFC_SOFT_SCL_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_sda_gpio", BOARD_NFC_SDA_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_scl_gpio", BOARD_NFC_SCL_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_irq_gpio", BOARD_NFC_IRQ_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_rst_gpio", BOARD_NFC_RST_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_uart_tx_gpio", BOARD_NFC_UART_TX_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_uart_rx_gpio", BOARD_NFC_UART_RX_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_uart_baud", BOARD_NFC_UART_BAUD);
+#if BOARD_NFC_USE_SPI
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_sclk_gpio", BOARD_NFC_SPI_SCLK_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_mosi_gpio", BOARD_NFC_SPI_MOSI_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_miso_gpio", BOARD_NFC_SPI_MISO_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_cs_gpio", BOARD_NFC_SPI_CS_GPIO);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_hz", BOARD_NFC_SPI_HZ);
+#else
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_sclk_gpio", -1);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_mosi_gpio", -1);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_miso_gpio", -1);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_cs_gpio", -1);
+    cJSON_AddNumberToObject(ji2c, "nfc_spi_hz", 0);
+#endif
+    cJSON_AddBoolToObject(ji2c, "nfc_shares_camera_sccb", BOARD_NFC_SHARES_CAMERA_SCCB);
+    cJSON_AddBoolToObject(ji2c, "nfc_shares_touch_i2c", BOARD_NFC_SHARES_TOUCH_I2C);
+    cJSON_AddNumberToObject(ji2c, "nfc_sda_level",
+                            BOARD_NFC_SDA_GPIO == GPIO_NUM_NC ? -1 :
+                            gpio_get_level(BOARD_NFC_SDA_GPIO));
+    cJSON_AddNumberToObject(ji2c, "nfc_scl_level",
+                            BOARD_NFC_SCL_GPIO == GPIO_NUM_NC ? -1 :
+                            gpio_get_level(BOARD_NFC_SCL_GPIO));
+    cJSON_AddNumberToObject(ji2c, "nfc_irq_level",
+                            BOARD_NFC_IRQ_GPIO == GPIO_NUM_NC ? -1 :
+                            gpio_get_level(BOARD_NFC_IRQ_GPIO));
+    cJSON_AddNumberToObject(ji2c, "nfc_rst_level",
+                            BOARD_NFC_RST_GPIO == GPIO_NUM_NC ? -1 :
+                            gpio_get_level(BOARD_NFC_RST_GPIO));
     cJSON_AddNumberToObject(ji2c, "nfc_addr", BOARD_NFC_PN532_ADDR);
     cJSON *jb = cJSON_AddObjectToObject(hw, "buttons");
     cJSON_AddBoolToObject(jb, "started", buttons.started);
     cJSON_AddNumberToObject(jb, "configured_count", buttons.configured_count);
+    cJSON_AddNumberToObject(jb, "up_gpio", BOARD_BUTTON_UP_GPIO);
+    cJSON_AddNumberToObject(jb, "down_gpio", BOARD_BUTTON_DOWN_GPIO);
+    cJSON_AddNumberToObject(jb, "ok_gpio", BOARD_BUTTON_OK_GPIO);
+    cJSON_AddNumberToObject(jb, "wake_gpio", BOARD_BUTTON_WAKE_GPIO);
+    cJSON_AddStringToObject(jb, "current_board_note",
+                            "no four conflict-free external GPIOs remain; keep NC until next PCB or USB/strap tradeoff is accepted");
     cJSON_AddBoolToObject(jb, "up_pressed", buttons.up_pressed);
     cJSON_AddBoolToObject(jb, "down_pressed", buttons.down_pressed);
     cJSON_AddBoolToObject(jb, "ok_pressed", buttons.ok_pressed);
@@ -1492,12 +1686,28 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(jui, "touch_max_x", ui.touch_max_x);
     cJSON_AddNumberToObject(jui, "touch_min_y", ui.touch_min_y);
     cJSON_AddNumberToObject(jui, "touch_max_y", ui.touch_max_y);
+    cJSON_AddBoolToObject(jui, "nfc_busy", ui.nfc_busy);
+    cJSON_AddBoolToObject(jui, "nfc_done", ui.nfc_done);
+    cJSON_AddBoolToObject(jui, "nfc_ok", ui.nfc_ok);
+    cJSON_AddNumberToObject(jui, "nfc_action", ui.nfc_action);
+    cJSON_AddStringToObject(jui, "nfc_last_err", esp_err_to_name(ui.nfc_last_err));
+    cJSON_AddNumberToObject(jui, "nfc_write_count", ui.nfc_write_count);
+    cJSON_AddStringToObject(jui, "nfc_payload", ui.nfc_payload ? ui.nfc_payload : "");
+    cJSON_AddStringToObject(jui, "nfc_message", ui.nfc_message ? ui.nfc_message : "");
+    cJSON_AddNumberToObject(jui, "screen_sleep_minutes", ui.screen_sleep_minutes);
+    cJSON_AddNumberToObject(jui, "idle_ms", ui.idle_ms);
+    cJSON *jbt = cJSON_AddObjectToObject(hw, "bluetooth");
+    cJSON_AddBoolToObject(jbt, "printer_placeholder", true);
+    cJSON_AddBoolToObject(jbt, "radio_enabled", false);
+    cJSON_AddStringToObject(jbt, "role", "partdb_qr_label_printer");
+    cJSON_AddStringToObject(jbt, "note", "reserved only; BT stack stays disabled until printer protocol is implemented");
     cJSON *jnfc = cJSON_AddObjectToObject(hw, "nfc_service");
     cJSON_AddBoolToObject(jnfc, "started", nfc.started);
     cJSON_AddBoolToObject(jnfc, "ready", nfc.ready);
     cJSON_AddBoolToObject(jnfc, "paused_for_camera", nfc.paused_for_camera);
     cJSON_AddBoolToObject(jnfc, "paused_for_request", nfc.paused_for_request);
     cJSON_AddBoolToObject(jnfc, "tag_present", nfc.tag_present);
+    cJSON_AddBoolToObject(jnfc, "empty", nfc.tag_present && nfc.text[0] == '\0');
     cJSON_AddStringToObject(jnfc, "uid", nfc.uid);
     cJSON_AddStringToObject(jnfc, "text", nfc.text);
     cJSON_AddNumberToObject(jnfc, "last_seen_ms", nfc.last_seen_ms);
@@ -1723,6 +1933,100 @@ static esp_err_t hardware_diagnose_post(httpd_req_t *req)
     return send_err;
 }
 
+static void add_psram_diag_json(cJSON *resp, const psram_diag_status_t *st)
+{
+    cJSON_AddBoolToObject(resp, "initialized", st->initialized);
+    cJSON_AddNumberToObject(resp, "chip_size", st->chip_size);
+    cJSON_AddNumberToObject(resp, "heap_total", st->heap_total);
+    cJSON_AddNumberToObject(resp, "heap_free", st->heap_free);
+    cJSON_AddNumberToObject(resp, "heap_largest", st->heap_largest);
+    cJSON_AddNumberToObject(resp, "mapped_start", (double)st->mapped_start);
+    cJSON_AddNumberToObject(resp, "mapped_end", (double)st->mapped_end);
+    cJSON_AddNumberToObject(resp, "mapped_size", st->mapped_size);
+    cJSON_AddNumberToObject(resp, "heap_candidate_size", st->heap_candidate_size);
+    cJSON_AddBoolToObject(resp, "mem_test_ran", st->mem_test_ran);
+    cJSON_AddBoolToObject(resp, "mem_test_ok", st->mem_test_ok);
+    cJSON_AddStringToObject(resp, "last_mem_test_err", esp_err_to_name(st->last_mem_test_err));
+    cJSON_AddStringToObject(resp, "last_add_heap_err", esp_err_to_name(st->last_add_heap_err));
+}
+
+static esp_err_t psram_diagnose_get(httpd_req_t *req)
+{
+    psram_diag_status_t st;
+    psram_diag_collect(&st);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    add_psram_diag_json(resp, &st);
+    esp_err_t send_err = send_json(req, resp);
+    cJSON_Delete(resp);
+    return send_err;
+}
+
+static esp_err_t psram_test_post(httpd_req_t *req)
+{
+    (void)req;
+    esp_err_t err = psram_diag_run_mem_test();
+    psram_diag_status_t st;
+    psram_diag_collect(&st);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "err", esp_err_to_name(err));
+    add_psram_diag_json(resp, &st);
+    esp_err_t send_err = send_json(req, resp);
+    cJSON_Delete(resp);
+    return send_err;
+}
+
+static esp_err_t psram_read_probe_post(httpd_req_t *req)
+{
+    (void)req;
+    esp_err_t err = psram_diag_run_read_probe();
+    psram_diag_status_t st;
+    psram_diag_collect(&st);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "err", esp_err_to_name(err));
+    add_psram_diag_json(resp, &st);
+    esp_err_t send_err = send_json(req, resp);
+    cJSON_Delete(resp);
+    return send_err;
+}
+
+static esp_err_t psram_heap_probe_post(httpd_req_t *req)
+{
+    (void)req;
+    esp_err_t err = psram_diag_run_heap_probe();
+    psram_diag_status_t st;
+    psram_diag_collect(&st);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "err", esp_err_to_name(err));
+    add_psram_diag_json(resp, &st);
+    esp_err_t send_err = send_json(req, resp);
+    cJSON_Delete(resp);
+    return send_err;
+}
+
+static esp_err_t psram_add_heap_post(httpd_req_t *req)
+{
+    (void)req;
+    esp_err_t err = psram_diag_add_to_heap();
+    psram_diag_status_t st;
+    psram_diag_collect(&st);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "err", esp_err_to_name(err));
+    add_psram_diag_json(resp, &st);
+    esp_err_t send_err = send_json(req, resp);
+    cJSON_Delete(resp);
+    return send_err;
+}
+
 static esp_err_t buttons_status_get(httpd_req_t *req)
 {
     button_input_status_t buttons = button_input_get_status();
@@ -1766,6 +2070,14 @@ static void add_ui_status_to_json(cJSON *resp)
     cJSON_AddNumberToObject(resp, "touch_max_x", ui.touch_max_x);
     cJSON_AddNumberToObject(resp, "touch_min_y", ui.touch_min_y);
     cJSON_AddNumberToObject(resp, "touch_max_y", ui.touch_max_y);
+    cJSON_AddBoolToObject(resp, "nfc_busy", ui.nfc_busy);
+    cJSON_AddBoolToObject(resp, "nfc_done", ui.nfc_done);
+    cJSON_AddBoolToObject(resp, "nfc_ok", ui.nfc_ok);
+    cJSON_AddNumberToObject(resp, "nfc_action", ui.nfc_action);
+    cJSON_AddStringToObject(resp, "nfc_last_err", esp_err_to_name(ui.nfc_last_err));
+    cJSON_AddNumberToObject(resp, "nfc_write_count", ui.nfc_write_count);
+    cJSON_AddStringToObject(resp, "nfc_payload", ui.nfc_payload ? ui.nfc_payload : "");
+    cJSON_AddStringToObject(resp, "nfc_message", ui.nfc_message ? ui.nfc_message : "");
     cJSON_AddNumberToObject(resp, "touch_rotation", s_cfg ? s_cfg->touch_rotation : 2);
     cJSON_AddBoolToObject(resp, "touch_swap_xy", s_cfg ? s_cfg->touch_swap_xy : false);
     cJSON_AddBoolToObject(resp, "touch_flip_x", s_cfg ? s_cfg->touch_flip_x : false);
@@ -1811,7 +2123,12 @@ static bool ui_page_from_string(const char *name, device_ui_page_t *page)
         *page = DEVICE_UI_PAGE_CAMERA;
         return true;
     }
-    if (strcasecmp(name, "info") == 0 ||
+    if (strcasecmp(name, "info") == 0 || strcasecmp(name, "parts") == 0 ||
+        strcasecmp(name, "part-list") == 0 || strcasecmp(name, "partlist") == 0) {
+        *page = DEVICE_UI_PAGE_PARTS;
+        return true;
+    }
+    if (strcasecmp(name, "system") == 0 || strcasecmp(name, "status") == 0 ||
         strcasecmp(name, "hardware") == 0 || strcasecmp(name, "hw") == 0) {
         *page = DEVICE_UI_PAGE_HARDWARE;
         return true;
@@ -1946,9 +2263,13 @@ static esp_err_t nfc_partdb_read_post(httpd_req_t *req)
     bool request_barcode = json_string_copy(req_json, "barcode", barcode, sizeof(barcode));
     esp_err_t read_err = ESP_OK;
     if (!request_barcode) {
-        nfc_manual_request_begin();
-        read_err = nfc_pn532_read_ndef_text(barcode, sizeof(barcode), 2500);
-        nfc_manual_request_end();
+        nfc_tag_t tag = {0};
+        read_err = nfc_service_claim_tag(&tag, 2500);
+        if (read_err == ESP_OK) {
+            read_err = nfc_pn532_read_ndef_text_from_tag(&tag, barcode, sizeof(barcode), 2500);
+            nfc_service_release_tag();
+            nfc_restart_after_manual_io();
+        }
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -2008,7 +2329,7 @@ static esp_err_t nfc_partdb_write_post(httpd_req_t *req)
     bool has_ipn = json_string_copy(req_json, "ipn", requested_ipn, sizeof(requested_ipn));
     char payload_kind[24] = {0};
     if (!json_string_copy(req_json, "payload_kind", payload_kind, sizeof(payload_kind))) {
-        snprintf(payload_kind, sizeof(payload_kind), "%s", has_ipn ? "ipn" : "internal");
+        snprintf(payload_kind, sizeof(payload_kind), "%s", has_ipn ? "ipn" : "link");
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -2059,6 +2380,16 @@ static esp_err_t nfc_partdb_write_post(httpd_req_t *req)
             } else {
                 err = partdb_ipn_for_target_json(root, &target, payload, sizeof(payload));
             }
+        } else if (strcasecmp(payload_kind, "link") == 0 ||
+                   strcasecmp(payload_kind, "route") == 0 ||
+                   strcasecmp(payload_kind, "path") == 0) {
+            if (target.prefix == 'L') {
+                snprintf(payload, sizeof(payload), "l/%d", target.id);
+            } else if (target.prefix == 'P') {
+                snprintf(payload, sizeof(payload), "p/%d", target.id);
+            } else {
+                err = ESP_ERR_INVALID_ARG;
+            }
         } else if (strcasecmp(payload_kind, "internal") == 0 ||
                    strcasecmp(payload_kind, "internal_barcode") == 0 ||
                    strcasecmp(payload_kind, "barcode") == 0) {
@@ -2069,9 +2400,16 @@ static esp_err_t nfc_partdb_write_post(httpd_req_t *req)
     }
 
     if (err == ESP_OK && commit) {
-        nfc_manual_request_begin();
-        err = nfc_pn532_write_ndef_text(payload, 3000);
-        nfc_manual_request_end();
+        nfc_tag_t tag = {0};
+        err = nfc_service_claim_tag(&tag, 3500);
+        if (err == ESP_OK) {
+            err = nfc_pn532_write_ndef_text_to_tag(&tag, payload, 3000);
+            if (err == ESP_OK) {
+                nfc_service_note_tag_payload(&tag, payload);
+            }
+            nfc_service_release_tag();
+            nfc_restart_after_manual_io();
+        }
     }
     cJSON_AddBoolToObject(root, "ok", err == ESP_OK && (!commit || verified));
     cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
@@ -2216,6 +2554,7 @@ static esp_err_t fonts_upload_post(httpd_req_t *req)
     char *buf = malloc(4096);
     if (!buf) {
         fclose(f);
+        (void)remove(path);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
         return ESP_OK;
     }
@@ -2374,6 +2713,7 @@ static esp_err_t sd_upload_post(httpd_req_t *req)
     char *buf = malloc(2048);
     if (!buf) {
         fclose(f);
+        (void)remove(abs_path);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
         return ESP_OK;
     }
@@ -2396,6 +2736,9 @@ static esp_err_t sd_upload_post(httpd_req_t *req)
     }
     free(buf);
     fclose(f);
+    if (err != ESP_OK) {
+        (void)remove(abs_path);
+    }
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
@@ -2686,6 +3029,7 @@ static esp_err_t assets_upload_post(httpd_req_t *req)
     char *buf = malloc(2048);
     if (!buf) {
         fclose(f);
+        (void)remove(abs_path);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
         return ESP_OK;
     }
@@ -2862,59 +3206,132 @@ static esp_err_t sd_file_get(httpd_req_t *req)
     return ESP_OK;
 }
 
-static void uid_to_hex(const nfc_tag_t *tag, char *out, size_t out_len)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    if (!tag || !out || out_len == 0) {
-        return;
-    }
-    out[0] = '\0';
-    size_t needed = (size_t)tag->uid_len * 2 + 1;
-    if (out_len < needed) {
-        return;
-    }
-    for (uint8_t i = 0; i < tag->uid_len; i++) {
-        out[i * 2] = hex[tag->uid[i] >> 4];
-        out[i * 2 + 1] = hex[tag->uid[i] & 0x0f];
-    }
-    out[tag->uid_len * 2] = '\0';
-}
-
-static void nfc_manual_request_begin(void)
-{
-    nfc_service_suspend_for_request();
-    vTaskDelay(pdMS_TO_TICKS(180));
-}
-
-static void nfc_manual_request_end(void)
-{
-    nfc_service_resume_after_request();
-}
-
 static esp_err_t nfc_read_get(httpd_req_t *req)
 {
-    esp_err_t err = ESP_OK;
-    nfc_manual_request_begin();
-    if (!nfc_pn532_is_ready()) {
-        err = nfc_pn532_init();
-    }
-    nfc_tag_t tag = {0};
-    if (err == ESP_OK) {
-        err = nfc_pn532_read_passive(&tag, 1500);
-    }
-    nfc_manual_request_end();
-    char uid[sizeof(tag.uid) * 2 + 1] = {0};
-    uid_to_hex(&tag, uid, sizeof(uid));
+    nfc_service_status_t nfc = nfc_service_get_status();
+    esp_err_t err = nfc.tag_present ? ESP_OK : ESP_ERR_NOT_FOUND;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", err == ESP_OK || err == ESP_ERR_NOT_FOUND);
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
+    cJSON_AddBoolToObject(root, "ready", nfc.ready || nfc_pn532_is_ready());
+    cJSON_AddBoolToObject(root, "present", nfc.tag_present);
+    cJSON_AddBoolToObject(root, "empty", nfc.tag_present && nfc.text[0] == '\0');
+    cJSON_AddStringToObject(root, "uid", nfc.uid);
+    cJSON_AddNumberToObject(root, "uid_len", strlen(nfc.uid) / 2);
+    cJSON_AddStringToObject(root, "text", nfc.text);
+    ESP_LOGI(TAG, "nfc read err=%s ready=%d present=%d uid=%s",
+             esp_err_to_name(err), nfc.ready || nfc_pn532_is_ready(),
+             nfc.tag_present, nfc.uid);
+    esp_err_t send_err = send_json(req, root);
+    cJSON_Delete(root);
+    return send_err;
+}
+
+static void nfc_restart_after_manual_io(void)
+{
+    (void)nfc_service_restart(2500);
+}
+
+static esp_err_t nfc_probe_get(httpd_req_t *req)
+{
+    (void)req;
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    nfc_tag_t tag = {0};
+    nfc_type2_info_t info = {0};
+    info.read0_err = ESP_ERR_NOT_FOUND;
+    info.read4_err = ESP_ERR_NOT_FOUND;
+    err = nfc_service_claim_tag(&tag, 5000);
+    if (err == ESP_OK) {
+        err = nfc_pn532_probe_type2_from_tag(&tag, &info, 1500);
+        nfc_service_release_tag();
+        nfc_restart_after_manual_io();
+    }
+
+    char uid_hex[sizeof(tag.uid) * 2 + 1] = {0};
+    char page0_hex[sizeof(info.page0) * 2 + 1] = {0};
+    char page4_hex[sizeof(info.page4) * 2 + 1] = {0};
+    char cc_hex[sizeof(info.cc) * 2 + 1] = {0};
+    bytes_to_hex_string(tag.uid, tag.uid_len, uid_hex, sizeof(uid_hex));
+    bytes_to_hex_string(info.page0, sizeof(info.page0), page0_hex, sizeof(page0_hex));
+    bytes_to_hex_string(info.page4, sizeof(info.page4), page4_hex, sizeof(page4_hex));
+    bytes_to_hex_string(info.cc, sizeof(info.cc), cc_hex, sizeof(cc_hex));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
+    cJSON_AddStringToObject(root, "uid", uid_hex);
+    cJSON_AddNumberToObject(root, "uid_len", tag.uid_len);
+    cJSON_AddNumberToObject(root, "target_number", tag.target_number);
+    cJSON_AddBoolToObject(root, "type2_ndef", info.type2_ndef);
+    cJSON_AddNumberToObject(root, "capacity", (double)info.capacity);
+    cJSON_AddStringToObject(root, "read0_err", esp_err_to_name(info.read0_err));
+    cJSON_AddStringToObject(root, "read4_err", esp_err_to_name(info.read4_err));
+    cJSON_AddStringToObject(root, "cc", cc_hex);
+    cJSON_AddStringToObject(root, "page0", page0_hex);
+    cJSON_AddStringToObject(root, "page4", page4_hex);
+    cJSON_AddBoolToObject(root, "can_type2_write", info.type2_ndef && info.read4_err == ESP_OK);
+    cJSON_AddStringToObject(root, "expected_card", "NTAG21x/MIFARE Ultralight/Type 2 NDEF tag");
+    ESP_LOGI(TAG, "nfc probe err=%s uid=%s type2=%d read0=%s read4=%s cc=%s",
+             esp_err_to_name(err), uid_hex, info.type2_ndef,
+             esp_err_to_name(info.read0_err), esp_err_to_name(info.read4_err), cc_hex);
+    esp_err_t send_err = send_json(req, root);
+    cJSON_Delete(root);
+    return send_err;
+}
+
+static esp_err_t nfc_erase_post(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[64];
+        (void)read_body(req, body, sizeof(body));
+    }
+
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    nfc_tag_t tag = {0};
+    err = nfc_service_claim_tag(&tag, 3500);
+    if (err == ESP_OK) {
+        err = nfc_pn532_erase_ndef_from_tag(&tag, 1200);
+        if (err == ESP_OK) {
+            nfc_service_note_tag_payload(&tag, "");
+        }
+        nfc_service_release_tag();
+        nfc_restart_after_manual_io();
+    }
+
+    nfc_service_status_t nfc = nfc_service_get_status();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
     cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
     cJSON_AddBoolToObject(root, "ready", nfc_pn532_is_ready());
-    cJSON_AddBoolToObject(root, "present", tag.uid_len > 0);
-    cJSON_AddStringToObject(root, "uid", uid);
-    cJSON_AddNumberToObject(root, "uid_len", tag.uid_len);
-    ESP_LOGI(TAG, "nfc read err=%s ready=%d present=%d uid=%s",
-             esp_err_to_name(err), nfc_pn532_is_ready(), tag.uid_len > 0, uid);
+    cJSON_AddBoolToObject(root, "erased", err == ESP_OK);
+    cJSON_AddBoolToObject(root, "present", nfc.tag_present);
+    cJSON_AddBoolToObject(root, "empty", err == ESP_OK && nfc.text[0] == '\0');
+    cJSON_AddStringToObject(root, "uid", nfc.uid);
+    cJSON_AddStringToObject(root, "payload_format", "empty_ndef_text");
+    ESP_LOGI(TAG, "nfc erase err=%s ready=%d",
+             esp_err_to_name(err), nfc_pn532_is_ready());
+    esp_err_t send_err = send_json(req, root);
+    cJSON_Delete(root);
+    return send_err;
+}
+
+static esp_err_t nfc_restart_post(httpd_req_t *req)
+{
+    if (req->content_len > 0) {
+        char body[64];
+        (void)read_body(req, body, sizeof(body));
+    }
+
+    esp_err_t err = nfc_service_restart(2500);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
+    cJSON_AddBoolToObject(root, "ready", nfc_pn532_is_ready());
+    cJSON_AddBoolToObject(root, "rst_configured", BOARD_NFC_RST_GPIO != GPIO_NUM_NC);
+    ESP_LOGI(TAG, "nfc restart err=%s ready=%d rst=%d",
+             esp_err_to_name(err), nfc_pn532_is_ready(),
+             BOARD_NFC_RST_GPIO != GPIO_NUM_NC);
     esp_err_t send_err = send_json(req, root);
     cJSON_Delete(root);
     return send_err;
@@ -2923,10 +3340,19 @@ static esp_err_t nfc_read_get(httpd_req_t *req)
 static esp_err_t camera_jpeg_get(httpd_req_t *req)
 {
     int64_t start_us = esp_timer_get_time();
-    camera_fb_t *fb = NULL;
-    esp_err_t err = camera_mgr_capture_jpeg(&fb);
-    if (err != ESP_OK || !fb) {
-        camera_mgr_deinit();
+    uint8_t *jpg = NULL;
+    size_t jpg_len = 0;
+    nfc_service_suspend_for_camera();
+    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    esp_err_t err = camera_mgr_capture_jpeg_bytes(&jpg, &jpg_len);
+    if (err != ESP_OK || !jpg || jpg_len == 0) {
+        if (jpg) {
+            camera_mgr_free_jpeg_bytes(jpg);
+        }
+        if (!camera_mgr_should_keep_online()) {
+            camera_mgr_deinit();
+        }
+        nfc_service_resume_after_camera();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
         return ESP_OK;
     }
@@ -2934,45 +3360,409 @@ static esp_err_t camera_jpeg_get(httpd_req_t *req)
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     int64_t send_start_us = esp_timer_get_time();
-    err = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    err = httpd_resp_send(req, (const char *)jpg, jpg_len);
     ESP_LOGI(TAG, "camera response capture_total=%lld ms send=%lld ms len=%u err=%s",
              (long long)((send_start_us - start_us) / 1000),
              (long long)((esp_timer_get_time() - send_start_us) / 1000),
-             (unsigned)fb->len,
+             (unsigned)jpg_len,
              esp_err_to_name(err));
-    camera_mgr_release_frame(fb);
-    camera_mgr_deinit();
+    camera_mgr_free_jpeg_bytes(jpg);
+    if (!camera_mgr_should_keep_online()) {
+        camera_mgr_deinit();
+    }
+    nfc_service_resume_after_camera();
     return err;
+}
+
+static esp_err_t camera_scan_jpeg_get(httpd_req_t *req)
+{
+    esp_err_t lock_err = ensure_camera_scan_mutex();
+    if (lock_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan mutex alloc failed");
+        return ESP_OK;
+    }
+    if (xSemaphoreTake(s_camera_scan_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera scan is already running");
+        return ESP_OK;
+    }
+
+    int64_t start_us = esp_timer_get_time();
+    camera_fb_t *fb = NULL;
+    nfc_service_suspend_for_camera();
+    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    esp_err_t err = camera_mgr_capture_scan_jpeg(&fb);
+    if (err != ESP_OK || !fb || !fb->buf || fb->len == 0 || fb->format != PIXFORMAT_JPEG) {
+        if (fb) {
+            camera_mgr_release_frame(fb);
+        }
+        if (!camera_mgr_should_keep_online()) {
+            camera_mgr_deinit();
+        }
+        nfc_service_resume_after_camera();
+        xSemaphoreGive(s_camera_scan_mutex);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_OK;
+    }
+
+    char width_hdr[12];
+    char height_hdr[12];
+    snprintf(width_hdr, sizeof(width_hdr), "%u", (unsigned)fb->width);
+    snprintf(height_hdr, sizeof(height_hdr), "%u", (unsigned)fb->height);
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Scan-Width", width_hdr);
+    httpd_resp_set_hdr(req, "X-Scan-Height", height_hdr);
+    int64_t send_start_us = esp_timer_get_time();
+    esp_err_t send_err = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    ESP_LOGI(TAG, "camera scan jpeg response capture_total=%lld ms send=%lld ms %ux%u len=%u err=%s",
+             (long long)((send_start_us - start_us) / 1000),
+             (long long)((esp_timer_get_time() - send_start_us) / 1000),
+             (unsigned)fb->width,
+             (unsigned)fb->height,
+             (unsigned)fb->len,
+             esp_err_to_name(send_err));
+    camera_mgr_release_frame(fb);
+    if (!camera_mgr_should_keep_online()) {
+        camera_mgr_deinit();
+    }
+    nfc_service_resume_after_camera();
+    xSemaphoreGive(s_camera_scan_mutex);
+    return send_err;
+}
+
+static bool camera_bridge_copy_text_target(cJSON *root, char *out, size_t out_len)
+{
+    if (!root || !out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    cJSON *target = cJSON_GetObjectItem(root, "target");
+    if (!cJSON_IsObject(target)) {
+        return false;
+    }
+    cJSON *barcode = cJSON_GetObjectItem(target, "barcode");
+    if (cJSON_IsString(barcode) && barcode->valuestring && barcode->valuestring[0]) {
+        char prefix = (char)toupper((unsigned char)barcode->valuestring[0]);
+        if (prefix == 'P' || prefix == 'L') {
+            snprintf(out, out_len, "%s", barcode->valuestring);
+            return out[0] != '\0';
+        }
+    }
+    cJSON *api_path = cJSON_GetObjectItem(target, "api_path");
+    if (cJSON_IsString(api_path) && api_path->valuestring &&
+        (strstr(api_path->valuestring, "/parts/") ||
+         strstr(api_path->valuestring, "/part_lots/"))) {
+        snprintf(out, out_len, "%s", api_path->valuestring);
+        return out[0] != '\0';
+    }
+    cJSON *scan_path = cJSON_GetObjectItem(target, "scan_path");
+    if (cJSON_IsString(scan_path) && scan_path->valuestring &&
+        (strstr(scan_path->valuestring, "/scan/part/") ||
+         strstr(scan_path->valuestring, "/scan/lot/"))) {
+        snprintf(out, out_len, "%s", scan_path->valuestring);
+        return out[0] != '\0';
+    }
+    return false;
+}
+
+static void add_camera_bridge_scan_summary(cJSON *root, const char *server_body)
+{
+    char text[QR_SCANNER_TEXT_MAX] = {0};
+    char decode_error[48] = {0};
+    int code_count = 0;
+    bool found = false;
+
+    cJSON *bridge = server_body && server_body[0] ? cJSON_Parse(server_body) : NULL;
+    if (bridge) {
+        cJSON *decode = cJSON_GetObjectItem(bridge, "decode");
+        cJSON *symbols = cJSON_IsObject(decode) ? cJSON_GetObjectItem(decode, "symbols") : NULL;
+        if (cJSON_IsArray(symbols)) {
+            code_count = cJSON_GetArraySize(symbols);
+        }
+        cJSON *decoded = cJSON_GetObjectItem(bridge, "decoded");
+        if (!cJSON_IsString(decoded) && cJSON_IsArray(symbols)) {
+            decoded = cJSON_GetArrayItem(symbols, 0);
+        }
+        (void)camera_bridge_copy_text_target(bridge, text, sizeof(text));
+        if (!text[0] && cJSON_IsString(decoded) && decoded->valuestring) {
+            snprintf(text, sizeof(text), "%s", decoded->valuestring);
+        }
+        cJSON *decode_err = cJSON_IsObject(decode) ? cJSON_GetObjectItem(decode, "err") : NULL;
+        if (cJSON_IsString(decode_err) && decode_err->valuestring) {
+            snprintf(decode_error, sizeof(decode_error), "%s", decode_err->valuestring);
+        }
+        found = cJSON_IsTrue(cJSON_GetObjectItem(bridge, "found")) && text[0] != '\0';
+        cJSON_Delete(bridge);
+    } else if (server_body && server_body[0]) {
+        snprintf(decode_error, sizeof(decode_error), "bridge_bad_json");
+    } else {
+        snprintf(decode_error, sizeof(decode_error), "bridge_empty_response");
+    }
+    if (!decode_error[0] && !found) {
+        snprintf(decode_error, sizeof(decode_error), "no_symbol");
+    }
+
+    cJSON_AddBoolToObject(root, "found", found);
+    cJSON_AddStringToObject(root, "text", text);
+    cJSON_AddNumberToObject(root, "code_count", code_count);
+    cJSON_AddStringToObject(root, "decode_error", decode_error);
+}
+
+static void add_qr_result_json(cJSON *root, const qr_scanner_result_t *result)
+{
+    if (!root || !result) {
+        return;
+    }
+    cJSON_AddBoolToObject(root, "found", result->found);
+    cJSON_AddStringToObject(root, "text", result->text);
+    cJSON_AddNumberToObject(root, "code_count", result->code_count);
+    cJSON_AddNumberToObject(root, "width", result->width);
+    cJSON_AddNumberToObject(root, "height", result->height);
+    cJSON_AddNumberToObject(root, "elapsed_ms", result->elapsed_ms);
+    cJSON_AddStringToObject(root, "decode_error", result->decode_error);
+}
+
+static bool add_camera_scan_target_json(cJSON *root, const char *text)
+{
+    if (!root || !text || !text[0]) {
+        return false;
+    }
+
+    partdb_barcode_target_t target = {0};
+    bool parsed_internal = target_from_barcode(text, &target);
+    bool parsed_path = !parsed_internal && target_from_partdb_path(text, &target);
+    bool parsed_user_barcode = false;
+    bool parsed_ipn = false;
+    partdb_client_status_t pdb = partdb_client_get_status();
+
+    if (!parsed_internal && !parsed_path && pdb.configured) {
+        parsed_user_barcode = target_from_user_barcode_lookup(root, text, &target);
+    }
+    if (!parsed_internal && !parsed_path && !parsed_user_barcode && pdb.configured) {
+        parsed_ipn = target_from_ipn_lookup(root, text, &target);
+    }
+
+    bool parsed = parsed_internal || parsed_path || parsed_user_barcode || parsed_ipn;
+    cJSON_AddStringToObject(root, "barcode_kind",
+                            parsed_internal ? "internal" :
+                            (parsed_path ? "partdb_path" :
+                            (parsed_user_barcode ? "part_lot_user_barcode" :
+                            (parsed_ipn ? "ipn" : "unparsed"))));
+    if (parsed) {
+        add_target_json(root, &target);
+        add_partdb_lookup_json(root, &target);
+    } else {
+        cJSON_AddStringToObject(root, "expected",
+                                "Part-DB barcode, scan path, API path, user barcode, or IPN");
+    }
+    return parsed;
+}
+
+static esp_err_t camera_capture_upload_to_bridge(const char *upload_path,
+                                                 char *content_type,
+                                                 size_t content_type_len,
+                                                 char *server_body,
+                                                 size_t server_body_len,
+                                                 size_t *frame_len,
+                                                 int *http_status,
+                                                 esp_err_t *capture_err,
+                                                 esp_err_t *upload_err)
+{
+    if (!upload_path || !upload_path[0] || !content_type || content_type_len == 0 ||
+        !server_body || server_body_len == 0 || !frame_len || !http_status ||
+        !capture_err || !upload_err) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *frame_len = 0;
+    *http_status = 0;
+    *capture_err = ESP_OK;
+    *upload_err = ESP_FAIL;
+    server_body[0] = '\0';
+    snprintf(content_type, content_type_len, "image/jpeg");
+
+    uint8_t *jpg = NULL;
+    size_t jpg_len = 0;
+    camera_fb_t *raw = NULL;
+    const uint8_t *upload_buf = NULL;
+    size_t upload_len = 0;
+
+    nfc_service_suspend_for_camera();
+    vTaskDelay(pdMS_TO_TICKS(BOARD_CAMERA_NFC_QUIET_MS));
+    bool has_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+    if (has_psram) {
+        *capture_err = camera_mgr_capture_jpeg_bytes(&jpg, &jpg_len);
+        upload_buf = jpg;
+        upload_len = jpg_len;
+    } else {
+        *capture_err = camera_mgr_capture_still_rgb565(&raw);
+        if (*capture_err == ESP_OK && raw && raw->buf && raw->len > 0) {
+            upload_buf = raw->buf;
+            upload_len = raw->len;
+            snprintf(content_type, content_type_len,
+                     "application/x-rgb565; width=%u; height=%u; endian=le",
+                     raw->width, raw->height);
+        }
+    }
+
+    if (*capture_err == ESP_OK && upload_buf && upload_len > 0) {
+        *frame_len = upload_len;
+        *upload_err = partdb_client_post_binary(upload_path, content_type,
+                                                upload_buf, upload_len,
+                                                server_body, server_body_len,
+                                                http_status);
+    }
+
+    if (jpg) {
+        camera_mgr_free_jpeg_bytes(jpg);
+    }
+    if (raw) {
+        camera_mgr_release_frame(raw);
+    }
+    if (!camera_mgr_should_keep_online()) {
+        camera_mgr_deinit();
+    }
+    nfc_service_resume_after_camera();
+    return *capture_err == ESP_OK ? *upload_err : *capture_err;
+}
+
+static esp_err_t camera_upload_post(httpd_req_t *req)
+{
+    char upload_path[160];
+    snprintf(upload_path, sizeof(upload_path), "%s",
+             s_cfg && s_cfg->camera_upload_url[0] ? s_cfg->camera_upload_url : "");
+
+    char query_path[sizeof(upload_path)];
+    if (get_query_value(req, "path", query_path, sizeof(query_path)) == ESP_OK && query_path[0]) {
+        snprintf(upload_path, sizeof(upload_path), "%s", query_path);
+    }
+
+    if (req->content_len > 0) {
+        char body[256];
+        if (!read_body(req, body, sizeof(body))) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid upload request");
+            return ESP_OK;
+        }
+        cJSON *root = cJSON_Parse(body);
+        cJSON *path = root ? cJSON_GetObjectItem(root, "path") : NULL;
+        if (cJSON_IsString(path) && path->valuestring && path->valuestring[0]) {
+            snprintf(upload_path, sizeof(upload_path), "%s", path->valuestring);
+        }
+        cJSON_Delete(root);
+    }
+
+    if (upload_path[0] == '\0') {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "err", "upload_url_not_configured");
+        cJSON_AddStringToObject(root, "message", "camera upload url is not configured");
+        esp_err_t send_err = send_json(req, root);
+        cJSON_Delete(root);
+        return send_err;
+    }
+
+    int64_t start_us = esp_timer_get_time();
+    char content_type[96] = "image/jpeg";
+    char *server_body = calloc(1, CAMERA_UPLOAD_RESPONSE_MAX);
+    if (!server_body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "response alloc failed");
+        return ESP_OK;
+    }
+
+    esp_err_t capture_err = ESP_OK;
+    int http_status = 0;
+    esp_err_t upload_err = ESP_FAIL;
+    size_t frame_len = 0;
+    (void)camera_capture_upload_to_bridge(upload_path, content_type, sizeof(content_type),
+                                          server_body, CAMERA_UPLOAD_RESPONSE_MAX,
+                                          &frame_len, &http_status,
+                                          &capture_err, &upload_err);
+
+    bool upload_http_ok = http_status >= 200 && http_status < 300;
+    bool ok = capture_err == ESP_OK && upload_err == ESP_OK && upload_http_ok;
+    int64_t elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+    ESP_LOGI(TAG, "camera upload capture=%s upload=%s status=%d len=%u type=%s elapsed=%lld ms",
+             esp_err_to_name(capture_err), esp_err_to_name(upload_err), http_status,
+             (unsigned)frame_len, content_type, (long long)elapsed_ms);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", ok);
+    cJSON_AddStringToObject(root, "path", upload_path);
+    cJSON_AddStringToObject(root, "content_type", content_type);
+    cJSON_AddNumberToObject(root, "sent_bytes", (double)frame_len);
+    cJSON_AddNumberToObject(root, "http_status", http_status);
+    cJSON_AddNumberToObject(root, "elapsed_ms", (double)elapsed_ms);
+    cJSON_AddStringToObject(root, "capture_err", esp_err_to_name(capture_err));
+    cJSON_AddStringToObject(root, "upload_err", esp_err_to_name(upload_err));
+    add_camera_bridge_scan_summary(root, server_body);
+    if (server_body[0]) {
+        cJSON_AddStringToObject(root, "server_response", server_body);
+    }
+    esp_err_t send_err = send_json(req, root);
+    cJSON_Delete(root);
+    free(server_body);
+    return send_err;
 }
 
 static esp_err_t camera_scan_post(httpd_req_t *req)
 {
-    (void)req;
-    qr_scanner_result_t result = {0};
-    esp_err_t err = qr_scanner_scan(&result);
+    esp_err_t lock_err = ensure_camera_scan_mutex();
+    if (lock_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan mutex alloc failed");
+        return ESP_OK;
+    }
+    if (xSemaphoreTake(s_camera_scan_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        cJSON *busy = cJSON_CreateObject();
+        cJSON_AddBoolToObject(busy, "ok", false);
+        cJSON_AddStringToObject(busy, "source", "busy");
+        cJSON_AddStringToObject(busy, "err", esp_err_to_name(ESP_ERR_TIMEOUT));
+        cJSON_AddStringToObject(busy, "message", "camera scan is already running");
+        esp_err_t send_err = send_json(req, busy);
+        cJSON_Delete(busy);
+        return send_err;
+    }
+
+    int64_t start_us = esp_timer_get_time();
+    qr_scanner_result_t local = {0};
+    esp_err_t local_err = qr_scanner_scan(&local);
+    esp_err_t capture_err = (local_err == ESP_OK || local_err == ESP_ERR_NOT_FOUND) ?
+                            ESP_OK : local_err;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", err == ESP_OK || err == ESP_ERR_NOT_FOUND);
-    cJSON_AddStringToObject(root, "err", esp_err_to_name(err));
-    cJSON_AddBoolToObject(root, "found", result.found);
-    cJSON_AddStringToObject(root, "text", result.text);
-    cJSON_AddNumberToObject(root, "code_count", result.code_count);
-    cJSON_AddNumberToObject(root, "width", result.width);
-    cJSON_AddNumberToObject(root, "height", result.height);
-    cJSON_AddNumberToObject(root, "elapsed_ms", result.elapsed_ms);
-    cJSON_AddStringToObject(root, "decode_error", result.decode_error);
-    ESP_LOGI(TAG, "qr scan http err=%s found=%d text=%s",
-             esp_err_to_name(err), result.found, result.found ? result.text : "-");
+    cJSON_AddBoolToObject(root, "ok", capture_err == ESP_OK &&
+                          (local_err == ESP_OK || local_err == ESP_ERR_NOT_FOUND));
+    cJSON_AddStringToObject(root, "err", esp_err_to_name(local_err));
+    cJSON_AddStringToObject(root, "source", "local");
+    cJSON_AddBoolToObject(root, "remote_decode_enabled", false);
+    cJSON_AddStringToObject(root, "capture_err", esp_err_to_name(capture_err));
+    cJSON_AddNumberToObject(root, "total_elapsed_ms",
+                            (double)((esp_timer_get_time() - start_us) / 1000));
+    add_qr_result_json(root, &local);
+    if (local.found) {
+        add_camera_scan_target_json(root, local.text);
+    }
+
+    ESP_LOGI(TAG, "camera local scan err=%s found=%d text=%s",
+             esp_err_to_name(local_err), local.found, local.found ? local.text : "-");
     esp_err_t send_err = send_json(req, root);
     cJSON_Delete(root);
+    xSemaphoreGive(s_camera_scan_mutex);
     return send_err;
 }
 
 static esp_err_t ota_post(httpd_req_t *req)
 {
+    if (req->content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty firmware image");
+        return ESP_OK;
+    }
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (!update_partition) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
+        return ESP_OK;
+    }
+    if ((size_t)req->content_len > update_partition->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "firmware image is too large");
         return ESP_OK;
     }
 
@@ -3025,9 +3815,11 @@ esp_err_t http_server_start(app_config_t *cfg)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 8192;
-    config.max_uri_handlers = 40;
-    config.recv_wait_timeout = 60;
+    config.stack_size = HTTP_SERVER_STACK_BYTES;
+    config.max_open_sockets = 8;
+    config.max_uri_handlers = 64;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 30;
     config.send_wait_timeout = 15;
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config), TAG, "http start failed");
@@ -3041,6 +3833,11 @@ esp_err_t http_server_start(app_config_t *cfg)
         {.uri = "/api/nfc/partdb/read", .method = HTTP_POST, .handler = nfc_partdb_read_post},
         {.uri = "/api/nfc/partdb/write", .method = HTTP_POST, .handler = nfc_partdb_write_post},
         {.uri = "/api/hardware/diagnose", .method = HTTP_POST, .handler = hardware_diagnose_post},
+        {.uri = "/api/psram/diagnose", .method = HTTP_GET, .handler = psram_diagnose_get},
+        {.uri = "/api/psram/read_probe", .method = HTTP_POST, .handler = psram_read_probe_post},
+        {.uri = "/api/psram/heap_probe", .method = HTTP_POST, .handler = psram_heap_probe_post},
+        {.uri = "/api/psram/test", .method = HTTP_POST, .handler = psram_test_post},
+        {.uri = "/api/psram/add_heap", .method = HTTP_POST, .handler = psram_add_heap_post},
         {.uri = "/api/buttons/status", .method = HTTP_GET, .handler = buttons_status_get},
         {.uri = "/api/ui/status", .method = HTTP_GET, .handler = ui_status_get},
         {.uri = "/api/ui/page", .method = HTTP_POST, .handler = ui_page_post},
@@ -3050,6 +3847,9 @@ esp_err_t http_server_start(app_config_t *cfg)
         {.uri = "/api/display/power", .method = HTTP_POST, .handler = display_power_post},
         {.uri = "/api/touch", .method = HTTP_GET, .handler = touch_get},
         {.uri = "/api/nfc/read", .method = HTTP_GET, .handler = nfc_read_get},
+        {.uri = "/api/nfc/probe", .method = HTTP_GET, .handler = nfc_probe_get},
+        {.uri = "/api/nfc/erase", .method = HTTP_POST, .handler = nfc_erase_post},
+        {.uri = "/api/nfc/restart", .method = HTTP_POST, .handler = nfc_restart_post},
         {.uri = "/api/sd/mount", .method = HTTP_GET, .handler = sd_mount_get},
         {.uri = "/api/sd/prepare", .method = HTTP_POST, .handler = sd_prepare_post},
         {.uri = "/api/fonts/list", .method = HTTP_GET, .handler = fonts_list_get},
@@ -3063,7 +3863,9 @@ esp_err_t http_server_start(app_config_t *cfg)
         {.uri = "/api/assets/select", .method = HTTP_POST, .handler = assets_select_post},
         {.uri = "/api/assets/upload", .method = HTTP_POST, .handler = assets_upload_post},
         {.uri = "/api/assets/delete", .method = HTTP_POST, .handler = assets_delete_post},
+        {.uri = "/api/camera/upload", .method = HTTP_POST, .handler = camera_upload_post},
         {.uri = "/api/camera/scan", .method = HTTP_POST, .handler = camera_scan_post},
+        {.uri = "/api/camera/scan.jpg", .method = HTTP_GET, .handler = camera_scan_jpeg_get},
         {.uri = "/api/camera.jpg", .method = HTTP_GET, .handler = camera_jpeg_get},
         {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post},
     };

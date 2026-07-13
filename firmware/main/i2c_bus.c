@@ -1,6 +1,7 @@
 #include "i2c_bus.h"
 
 #include "board_config.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -20,20 +21,11 @@ typedef struct {
 
 static i2c_device_slot_t s_devices[8];
 
-static void clear_device_slots_locked(void)
+static esp_err_t install_bus_handle(void)
 {
-    for (size_t i = 0; i < sizeof(s_devices) / sizeof(s_devices[0]); i++) {
-        if (s_devices[i].used && s_devices[i].handle) {
-            (void)i2c_master_bus_rm_device(s_devices[i].handle);
-        }
-        s_devices[i] = (i2c_device_slot_t){0};
-    }
-}
-
-esp_err_t i2c_bus_init(void)
-{
-    if (s_installed) {
-        return ESP_OK;
+    if (BOARD_I2C_SDA_GPIO == GPIO_NUM_NC || BOARD_I2C_SCL_GPIO == GPIO_NUM_NC) {
+        ESP_LOGW(TAG, "I2C disabled: SDA=%d SCL=%d", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO);
+        return ESP_ERR_INVALID_STATE;
     }
 
     i2c_master_bus_config_t cfg = {
@@ -50,12 +42,36 @@ esp_err_t i2c_bus_init(void)
         err = i2c_master_get_bus_handle(BOARD_I2C_PORT, &s_bus);
     }
     if (err == ESP_OK) {
+        ESP_LOGI(TAG, "I2C ready SDA=%d SCL=%d", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO);
+    }
+    return err;
+}
+
+static void clear_device_slots_locked(void)
+{
+    for (size_t i = 0; i < sizeof(s_devices) / sizeof(s_devices[0]); i++) {
+        if (s_devices[i].used && s_devices[i].handle) {
+            (void)i2c_master_bus_rm_device(s_devices[i].handle);
+        }
+        s_devices[i] = (i2c_device_slot_t){0};
+    }
+}
+
+esp_err_t i2c_bus_init(void)
+{
+    if (s_installed) {
+        return ESP_OK;
+    }
+    if (!s_mutex) {
         s_mutex = xSemaphoreCreateMutex();
         if (!s_mutex) {
             return ESP_ERR_NO_MEM;
         }
+    }
+
+    esp_err_t err = install_bus_handle();
+    if (err == ESP_OK) {
         s_installed = true;
-        ESP_LOGI(TAG, "I2C ready SDA=%d SCL=%d", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO);
     }
     return err;
 }
@@ -95,9 +111,17 @@ static esp_err_t lock_bus(unsigned timeout_ms)
     return xSemaphoreTake(s_mutex, ticks) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
+static bool i2c_lines_are_low(void)
+{
+    if (BOARD_I2C_SDA_GPIO == GPIO_NUM_NC || BOARD_I2C_SCL_GPIO == GPIO_NUM_NC) {
+        return false;
+    }
+    return gpio_get_level(BOARD_I2C_SDA_GPIO) == 0 || gpio_get_level(BOARD_I2C_SCL_GPIO) == 0;
+}
+
 static void recover_bus_locked(esp_err_t err)
 {
-    if (!s_bus || (err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT)) {
+    if (!s_bus || (err != ESP_ERR_TIMEOUT && !(err == ESP_ERR_INVALID_STATE && i2c_lines_are_low()))) {
         return;
     }
     clear_device_slots_locked();
@@ -118,6 +142,35 @@ esp_err_t i2c_bus_reset(void)
     ESP_RETURN_ON_ERROR(lock_bus(1000), TAG, "lock failed");
     clear_device_slots_locked();
     esp_err_t err = i2c_master_bus_reset(s_bus);
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
+esp_err_t i2c_bus_reinstall(void)
+{
+    if (!s_mutex) {
+        s_mutex = xSemaphoreCreateMutex();
+        if (!s_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_RETURN_ON_ERROR(lock_bus(1000), TAG, "lock failed");
+    clear_device_slots_locked();
+    if (s_bus) {
+        (void)i2c_master_bus_reset(s_bus);
+        esp_err_t del_err = i2c_del_master_bus(s_bus);
+        if (del_err != ESP_OK) {
+            ESP_LOGW(TAG, "delete bus before reinstall failed: %s", esp_err_to_name(del_err));
+        } else {
+            s_bus = NULL;
+            s_installed = false;
+        }
+    }
+    esp_err_t err = install_bus_handle();
+    if (err == ESP_OK) {
+        s_installed = true;
+        ESP_LOGI(TAG, "I2C reinstalled");
+    }
     xSemaphoreGive(s_mutex);
     return err;
 }

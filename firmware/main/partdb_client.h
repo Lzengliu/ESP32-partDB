@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "app_config.h"
 #include "esp_err.h"
@@ -26,6 +27,9 @@ partdb_client_status_t partdb_client_get_status(void);
 esp_err_t partdb_client_request_json(partdb_http_method_t method, const char *path,
                                      const char *body, const char *content_type,
                                      char *out, size_t out_len, int *http_status);
+esp_err_t partdb_client_post_binary(const char *path, const char *content_type,
+                                    const uint8_t *data, size_t data_len,
+                                    char *out, size_t out_len, int *http_status);
 esp_err_t partdb_client_get_json(const char *path, char *out, size_t out_len, int *http_status);
 esp_err_t partdb_client_patch_json(const char *path, const char *body,
                                    char *out, size_t out_len, int *http_status);

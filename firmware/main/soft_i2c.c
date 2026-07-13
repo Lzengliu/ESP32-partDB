@@ -157,15 +157,17 @@ esp_err_t soft_i2c_init(const soft_i2c_config_t *cfg)
         cfg->sda_gpio == cfg->scl_gpio) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_ready && s_cfg.sda_gpio == cfg->sda_gpio && s_cfg.scl_gpio == cfg->scl_gpio &&
-        s_cfg.hz == cfg->hz) {
-        return ESP_OK;
-    }
 
-    s_cfg = *cfg;
-    if (s_cfg.hz == 0) {
-        s_cfg.hz = 50000;
+    soft_i2c_config_t next = *cfg;
+    if (next.hz == 0) {
+        next.hz = 50000;
     }
+    bool same_config = s_ready &&
+                       s_cfg.sda_gpio == next.sda_gpio &&
+                       s_cfg.scl_gpio == next.scl_gpio &&
+                       s_cfg.hz == next.hz;
+
+    s_cfg = next;
     s_half_period_us = 1000000U / (s_cfg.hz * 2U);
     if (s_half_period_us < 2) {
         s_half_period_us = 2;
@@ -190,8 +192,10 @@ esp_err_t soft_i2c_init(const soft_i2c_config_t *cfg)
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "software I2C ready SDA=%d SCL=%d hz=%lu",
-             s_cfg.sda_gpio, s_cfg.scl_gpio, (unsigned long)s_cfg.hz);
+    if (!same_config) {
+        ESP_LOGI(TAG, "software I2C ready SDA=%d SCL=%d hz=%lu",
+                 s_cfg.sda_gpio, s_cfg.scl_gpio, (unsigned long)s_cfg.hz);
+    }
     return ESP_OK;
 }
 
@@ -308,6 +312,32 @@ esp_err_t soft_i2c_recover(unsigned timeout_ms)
     xSemaphoreGive(s_mutex);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "software I2C recovery failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t soft_i2c_release(void)
+{
+    if (!s_ready) {
+        return ESP_OK;
+    }
+    if (s_mutex && lock_bus(100) != ESP_OK) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << s_cfg.sda_gpio) | (1ULL << s_cfg.scl_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&io);
+    s_ready = false;
+    ESP_LOGI(TAG, "software I2C released SDA=%d SCL=%d", s_cfg.sda_gpio, s_cfg.scl_gpio);
+
+    if (s_mutex) {
+        xSemaphoreGive(s_mutex);
     }
     return err;
 }

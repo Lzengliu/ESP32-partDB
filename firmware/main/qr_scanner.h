@@ -32,4 +32,8 @@ typedef struct {
 } qr_scanner_status_t;
 
 esp_err_t qr_scanner_scan(qr_scanner_result_t *result);
+esp_err_t qr_scanner_decode_grayscale(const uint8_t *gray, uint16_t width, uint16_t height,
+                                      qr_scanner_result_t *result);
+esp_err_t qr_scanner_decode_rgb565(const uint16_t *rgb565, uint16_t width, uint16_t height,
+                                   qr_scanner_result_t *result);
 qr_scanner_status_t qr_scanner_get_status(void);

@@ -1,0 +1,16 @@
+[Unit]
+Description=Part-DB ESP32 Camera Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/partdb-camera-bridge.env
+WorkingDirectory=/opt/esp32_part-db
+ExecStart=/usr/bin/python3 /opt/esp32_part-db/tools/camera_bridge/partdb_camera_bridge.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

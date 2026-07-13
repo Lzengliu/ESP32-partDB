@@ -1,79 +1,68 @@
 # ESP32-partDB
 
-ESP32-partDB 是围绕 Part-DB 元器件仓库开发的 ESP32-S3 硬件终端。它用于现场查询元器件、查看库存资料、扫码、出入库、写入 NFC 标签和管理终端资源。
+ESP32-partDB 是面向 Part-DB 元器件仓库的 ESP32-S3 触摸终端。它支持现场查询元器件、查看库存、扫码、出入库、NFC 标签读写，以及通过 Web 页面管理终端配置和资源。
 
-Part-DB 官方仓库：
-
-- https://github.com/Part-DB/Part-DB-server
-
-详细硬件运行逻辑、IO 引脚和后台功能见：
-
-- [ESP32-partDB V1.0 项目说明](docs/PROJECT_BRIEF_V1.0.md)
-- [ESP32-partDB V1.0 Project Brief](docs/PROJECT_BRIEF_V1.0_EN.md)
-
-## V1.0 定位
-
-- 固件主体：C / ESP-IDF
-- 设备端 UI：C 直接绘制到 ILI9488 屏幕
-- 后台服务：ESP32 本机 HTTP Server
-- 后台页面：内嵌 HTML/CSS/JavaScript
-- 外部系统：Part-DB，通过 HTTP API 对接
+- 当前稳定版本：V1.1
+- 作者：灵异大队长
+- 开源地址：https://github.com/Lzengliu/ESP32-partDB
+- Part-DB 上游：https://github.com/Part-DB/Part-DB-server
 
 ## 主要硬件
 
-- ESP32-S3 主控
-- ILI9488 SPI 触摸屏
-- FT6336 触摸控制器
+- ESP32-S3，16 MB Flash，8 MB Octal PSRAM
+- ILI9488 SPI 显示屏与 FT6336 触摸控制器
 - PN532 NFC 模块
-- TF 卡，SDMMC 1-bit
+- SDMMC 1-bit TF 卡
 - ESP32-S3 摄像头，用于二维码扫描
-- 支持在线 OTA 升级，后期除非有重大更新会发布整包，其余版本都将只发布 OTA 固件包
 
-## 主要功能
+## V1.1 功能
 
-- Part-DB 地址和 API Token 配置
-- 元器件模糊搜索
-- 搜索结果直达详情页
-- 元器件基础信息、简介、备注、参数、库存展示
-- 入库、出库写回 Part-DB
-- 摄像头扫码
-- NFC 读写流程
-- Web 后台配置、诊断、资源上传、OTA
-- V1.0 只支持固件内置中文字库；上传字体文件暂不参与运行时渲染
+- Part-DB 地址和 API Token 配置、搜索、详情与库存写回
+- 设备端主页、搜索结果、详情、快捷操作、状态和设置页面
+- 摄像头本地二维码识别，ZXing-C++ 优先、quirc 回退
+- PN532 后台读卡、NDEF 文本写入和清除
+- TF 卡文件、背景、开机图、锁屏图和字体资源管理
+- Web 配置、硬件诊断、相机预览、扫码和 OTA
+- 8/12/16 px 内置中英文字模与符号字模
+- OTA 回滚保护和启动健康确认
+
+完整功能和限制见 [功能说明](docs/FEATURES.md) 与 [已知问题](docs/KNOWN_ISSUES.md)。V1.0 到 V1.1 的逐项差异见 [版本对比](docs/CHANGES_V1.0_TO_V1.1.md)。
 
 ## 构建
+
+实测环境为 ESP-IDF v5.5.2：
 
 ```sh
 cd firmware
 idf.py set-target esp32s3
 idf.py build
+idf.py merge-bin
 ```
 
-V1.0 实测构建环境为 ESP-IDF v5.5.2。
+首次构建需要下载 `esp32-camera`、`esp_jpeg` 和 `quirc` 管理组件。ZXing-C++ 的精简源码已保存在 `third_party/zxing-cpp/`。
 
-## 刷写
+## 从 V1.0 升级
 
-推荐：
+V1.1 修改了分区表。第一次从 V1.0 升级时，必须把 V1.1 合并固件写入 `0x0`，不要使用 V1.0 Web 页只上传应用固件，否则设备仍会使用旧分区表。
 
 ```sh
-cd firmware
-idf.py -p PORT flash monitor
+python -m esptool --chip esp32s3 -b 460800 \
+  --before default_reset --after hard_reset write_flash \
+  0x0 esp32_partdb_terminal_v1.1_merged.bin
 ```
 
-GitHub Release 中的合并固件可直接刷写到 `0x0`：
+安装过 V1.1 分区表后，可使用 Web OTA 上传 `esp32_partdb_terminal_v1.1_ota.bin`。
 
-```sh
-python -m esptool --chip esp32s3 -b 460800 write_flash \
-  0x0 esp32_partdb_terminal_v1.0_merged.bin
-```
+## 发布文件
 
-## 当前限制
+- `esp32_partdb_terminal_v1.1_merged.bin`：完整首次刷写/跨分区版本升级镜像
+- `esp32_partdb_terminal_v1.1_ota.bin`：仅应用镜像，供相同分区布局的 OTA 使用
+- `esp32_partdb_terminal_v1.1_firmware.zip`：完整固件附件
+- `esp32_partdb_terminal_v1.1_source.zip`：清理后的公开源码
+- `SHA256SUMS`：发布文件 SHA-256 校验和
 
-- NFC 在当前硬件上仍可能离线，常见错误为 `ESP_ERR_NOT_FOUND`。
-- 外部字体上传可以保存文件，但 V1.0 未实现 TTF/OTF 实时渲染。
-- 详情页长文本仍可能被小屏空间截断。
-- 多批次元器件还没有完整批次选择页。
+发布和刷写细节见 [V1.1 发布说明](docs/RELEASE_V1.1.md)。
 
 ## 开源协议
 
-项目自有代码按 Apache License 2.0 发布。第三方依赖和字体数据按其原始协议保留声明，见 [NOTICE.md](NOTICE.md)。
+项目自有代码由灵异大队长按 Apache License 2.0 发布。第三方组件和生成字模继续使用各自的原始协议，详见 [NOTICE.md](NOTICE.md) 与 [第三方代码说明](docs/THIRD_PARTY_CODE.md)。

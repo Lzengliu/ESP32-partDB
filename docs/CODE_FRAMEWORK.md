@@ -1,104 +1,52 @@
 # 代码框架说明
 
-版本：V1.0
+版本：V1.1
 
-## 总体结构
+## 启动流程
 
-本项目是一个 ESP-IDF 单应用工程，入口在 `firmware/main/app_main.c`。启动后按硬件、配置、网络、Web 服务、设备 UI 的顺序初始化。
+入口为 `firmware/main/app_main.c`。启动时依次初始化 NVS/配置、PSRAM、TF 卡、显示与启动画面、触摸、NFC、相机、WiFi、HTTP 服务和设备 UI。若当前镜像处于 OTA 待验证状态，只有 WiFi、HTTP 与 UI 等核心服务成功启动后才确认镜像有效。
 
 ```text
 app_main.c
   app_config_load()
+  psram_diag_run()
   storage_sd_init()
   display_ili9488_init()
-  i2c_bus_init()
   touch_ft6336_init()
-  nfc_pn532_init()
+  nfc_service_start()
   camera_mgr_init()
   wifi_portal_start()
   http_server_start()
   device_ui_start()
+  confirm_pending_ota()
 ```
 
-## 核心模块
+## 模块边界
 
-### 配置和硬件定义
+- `board_config.h`：板级 GPIO、资源路径、作者与仓库信息。
+- `app_config.c/.h`：NVS 配置默认值、加载、校验和保存。
+- `display_ili9488.c/.h`：SPI 显示、背光和绘图基础接口。
+- `touch_ft6336.c/.h`、`soft_i2c.c/.h`：触摸读取、映射与总线恢复。
+- `device_ui.c/.h`：页面状态机、搜索、详情、库存、NFC 和扫码工作流。
+- `ui_font.c/.h`：8/12/16 px 内置字模渲染。
+- `wifi_portal.c/.h`：STA/AP 生命周期和联网状态。
+- `http_server.c/.h`：内嵌 Web 页与 HTTP API。
+- `partdb_client.c/.h`：Part-DB HTTP 请求、缓存和库存写回。
+- `storage_sd.c/.h`：TF 挂载、格式化、目录和文件访问。
+- `camera_mgr.c/.h`、`qr_scanner.c/.h`：相机帧、ZXing-C++ 与 quirc 解码。
+- `nfc_i2c.c/.h`、`nfc_pn532.c/.h`、`nfc_service.c/.h`：PN532 传输、NDEF 和后台服务。
+- `peripheral_arbiter.c/.h`：相机与 NFC 等耗时外设操作互斥。
+- `hardware_diag.c/.h`、`psram_diag.c/.h`：硬件状态与诊断。
 
-- `board_config.h`
-  - 集中定义屏幕、触摸、NFC、摄像头、TF 卡和按键引脚。
-  - V1.0 硬件验证阶段只建议改这个文件里的 GPIO。
-- `app_config.c/.h`
-  - 使用 NVS 保存 WiFi、Part-DB、屏幕、触摸、资源路径等配置。
-  - Web 配置页和设备 UI 共用同一份配置结构。
+## 第三方组件
 
-### 屏幕与触摸
+- `firmware/main/idf_component.yml` 声明 ESP-IDF 管理组件。
+- `firmware/dependencies.lock` 锁定组件版本。
+- `firmware/components/zxing_qr` 只编译 `third_party/zxing-cpp` 中扫码所需源码。
+- `firmware/managed_components` 是本地构建缓存，不进入源码包。
 
-- `display_ili9488.c/.h`
-  - SPI 初始化、ILI9488 命令、方向、亮度、基础绘制接口。
-- `touch_ft6336.c/.h`
-  - FT6336 触摸读取和坐标转换。
-- `device_ui.c/.h`
-  - 设备端主 UI、搜索列表、详情页、快捷出入库、NFC 写入确认弹窗、底部导航、软键盘。
+## 存储布局
 
-### 网络与 Web 管理
+`firmware/partitions.csv` 定义 NVS、OTA 数据、factory、两个 OTA 应用区、coredump、fontfs 和 spiffs。V1.1 的三个应用区均为 `0x480000`，与 V1.0 不兼容，因此首次升级必须刷写完整合并镜像。
 
-- `wifi_portal.c/.h`
-  - STA/AP 启动和 WiFi 配置入口。
-- `http_server.c/.h`
-  - Web 管理页面和设备 HTTP API。
-  - 包含配置保存、状态查询、硬件诊断、Part-DB 测试、文件上传、资源选择、OTA、NFC/扫码接口。
-
-### Part-DB 对接
-
-- `partdb_client.c/.h`
-  - 封装 HTTP GET/PATCH/POST。
-  - 自动拼接保存的 Part-DB base URL 和 Bearer Token。
-- `device_ui.c`
-  - 搜索、详情查询、库存写回逻辑在 UI 侧组织。
-  - 搜索列表进入详情页时使用搜索结果里的 Part ID 直接定位，避免二次精准 IPN/条码验证。
-
-### 存储与资源
-
-- `storage_sd.c/.h`
-  - TF 卡挂载、目录准备、文件读写、FAT/FAT32 支持。
-- Web 资源管理
-  - 背景图、开机动画、锁屏背景、字体文件上传。
-  - V1.0 中字体上传可保存和选择，但运行时仍以固件内置点阵字体为主。
-
-### 摄像头和二维码
-
-- `camera_mgr.c/.h`
-  - 摄像头初始化和 JPEG 帧获取。
-- `qr_scanner.c/.h`
-  - 使用 quirc 解码二维码。
-  - 扫码结果可进入详情页。
-
-### NFC
-
-- `nfc_i2c.c/.h`
-  - PN532 I2C 访问适配，可切换硬件 I2C 或软件 I2C。
-- `nfc_pn532.c/.h`
-  - PN532 初始化、读卡、写 NDEF 文本。
-- `nfc_service.c/.h`
-  - 周期读卡服务、状态缓存、与摄像头等外设的互斥。
-
-V1.0 的 NFC UI 和接口已经接入，但当前实机状态仍可能显示 `ESP_ERR_NOT_FOUND`，详见 `KNOWN_ISSUES.md`。
-
-## 构建配置
-
-- `firmware/sdkconfig.defaults`
-  - ESP32-S3 目标、16MB Flash、自定义分区、HTTPD 参数、FATFS 长文件名等。
-- `firmware/partitions.csv`
-  - factory/ota_0/ota_1 各 3MB。
-  - 预留 coredump、fontfs、spiffs 区域。
-- `firmware/dependencies.lock`
-  - 锁定 ESP-IDF 管理组件版本，便于 V1.0 复现。
-
-## 设备端 UI 页面
-
-- Home：库存概览、搜索入口、状态摘要。
-- Results：模糊搜索结果列表。
-- Detail：元器件详情、参数/备注展示、出入库和写 NFC。
-- Shortcuts：入库、出库、扫码、NFC 快捷入口。
-- Info：网络、硬件、Part-DB、TF 卡状态。
-- Settings：亮度、AP、资源选择、硬件诊断等。
+TF 卡用于缓存和用户资源，不是关键数据唯一存储位置。上传路径在服务端做相对路径校验，失败上传会清理零长度或不完整文件。

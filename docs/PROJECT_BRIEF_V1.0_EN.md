@@ -16,7 +16,7 @@ Part-DB upstream:
 | Backend service | C, ESP-IDF HTTP Server | The ESP32 hosts its own web UI and JSON APIs |
 | Backend web page | HTML/CSS/JavaScript | Embedded as strings in `http_server.c`; no external web server files are required |
 | Part-DB server | PHP/Symfony | External system; this firmware talks to it through the Part-DB HTTP API |
-| QR decoding | C, quirc | Camera frames are decoded locally on the ESP32 |
+| QR decoding | C/C++, ZXing-C++ | Camera frames are decoded locally on the ESP32 |
 
 ## Boot Flow
 
@@ -81,7 +81,7 @@ Runtime logic:
 
 ### PN532 NFC
 
-NFC uses a PN532 module. In the current configuration, it shares the hardware I2C bus with the touch controller.
+NFC uses a PN532 module on a dedicated hardware I2C bus: `SDA=GPIO43(TX)` and `SCL=GPIO41`. FT6336 touch uses a low-speed software I2C bus on GPIO3/GPIO44(RX), with GPIO46 as reset and INT left unconnected on the current prototype. Camera SCCB remains on GPIO4/GPIO5, so NFC and camera do not share pins.
 
 Runtime logic:
 
@@ -89,7 +89,7 @@ Runtime logic:
 - Read text is treated as a Part-DB object code, barcode, IPN, or link and can enter the Detail page.
 - NFC writing must be confirmed through a modal dialog on the Detail page before an NDEF text payload is written.
 
-V1.0 known issue: on the current hardware, PN532 may still report `ESP_ERR_NOT_FOUND`, so ESP32-to-PN532 I2C communication needs further debugging.
+V1.0 known issue: on the current hardware, PN532 may still report `ESP_ERR_NOT_FOUND`; PN532 I2C mode, wiring, pull-ups, and power-up timing still need verification.
 
 ### TF Card
 
@@ -133,20 +133,22 @@ Physical buttons are reserved in V1.0 but no GPIOs are configured. The primary i
 
 | Signal | GPIO / Address |
 | --- | --- |
-| I2C SDA | GPIO35 |
-| I2C SCL | GPIO36 |
+| I2C SDA | GPIO3 |
+| I2C SCL | GPIO44/RX |
 | I2C address | `0x38` |
-| RST | GPIO37 |
-| INT | GPIO41 |
+| RST | GPIO46 |
+| INT | NC |
 
 ### PN532 NFC
 
 | Signal | GPIO / Address |
 | --- | --- |
-| I2C SDA | GPIO35 |
-| I2C SCL | GPIO36 |
-| I2C address | `0x24` |
-| Software I2C | Disabled in V1.0 |
+| SPI SCLK | GPIO21 |
+| SPI MOSI | GPIO47 |
+| SPI MISO | GPIO48 |
+| SPI CS | GPIO43 |
+| SPI clock | 100 kHz during current bring-up |
+| SPI bus | Shared with the ILI9488 SPI bus, with dedicated CS; not shared with camera SCCB |
 
 ### TF Card SDMMC 1-bit
 

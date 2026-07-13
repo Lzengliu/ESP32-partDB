@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nfc_pn532.h"
+#include "nfc_service.h"
 #include "storage_sd.h"
 #include "touch_ft6336.h"
 
@@ -47,20 +48,23 @@ esp_err_t hardware_diag_run(const app_config_t *cfg)
     }
     log_result("display", s_status.display_err);
 
-    s_status.touch_err = touch_ft6336_init();
-    log_result("touch", s_status.touch_err);
+    nfc_service_suspend_for_camera();
+    vTaskDelay(pdMS_TO_TICKS(180));
+    s_status.camera_err = camera_mgr_init();
+    if (s_status.camera_err == ESP_OK && !camera_mgr_should_keep_online()) {
+        camera_mgr_deinit();
+    }
+    nfc_service_resume_after_camera();
+    log_result("camera", s_status.camera_err);
 
     s_status.nfc_err = nfc_pn532_init();
     log_result("nfc", s_status.nfc_err);
 
+    s_status.touch_err = touch_ft6336_init();
+    log_result("touch", s_status.touch_err);
+
     s_status.sd_err = storage_sd_prepare_paths();
     log_result("tf_card", s_status.sd_err);
-
-    s_status.camera_err = camera_mgr_init();
-    if (s_status.camera_err == ESP_OK) {
-        camera_mgr_deinit();
-    }
-    log_result("camera", s_status.camera_err);
 
     s_status.last_run_ms = (esp_timer_get_time() - start_us) / 1000;
     s_status.running = false;

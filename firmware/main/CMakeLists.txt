@@ -14,6 +14,7 @@ idf_component_register(
         "nfc_service.c"
         "partdb_client.c"
         "peripheral_arbiter.c"
+        "psram_diag.c"
         "qr_scanner.c"
         "soft_i2c.c"
         "storage_sd.c"
@@ -29,7 +30,9 @@ idf_component_register(
         esp_driver_sdmmc
         esp_http_client
         esp_http_server
+        esp_jpeg
         esp_netif
+        esp_psram
         esp_timer
         esp_wifi
         fatfs
@@ -38,4 +41,5 @@ idf_component_register(
         quirc
         sdmmc
         vfs
+        zxing_qr
 )
