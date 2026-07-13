@@ -14,6 +14,9 @@ backups/
 Part-DB-server-master/
 喵哎 ESP32 S3 墨水屏/
 
+# Local raw demo recordings; optimized copies are published from docs/demo/
+演示/
+
 # Editor and OS files
 .vscode/
 .idea/

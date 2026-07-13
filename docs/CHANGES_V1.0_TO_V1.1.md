@@ -1,5 +1,7 @@
 # V1.0 到 V1.1 变更对比
 
+[English Version](CHANGES_V1.0_TO_V1.1_EN.md)
+
 对比基线：`dist/v1.0/source/` 保存的 V1.0 公开源码包。
 
 ## 不兼容变更

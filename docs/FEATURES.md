@@ -1,5 +1,7 @@
 # 主要功能区说明
 
+[English Version](FEATURES_EN.md)
+
 版本：V1.1
 
 ## Part-DB
@@ -32,6 +34,8 @@
 - `/api/camera.jpg` 提供预览，`/api/camera/scan` 执行本地识别。
 
 当前相机模组没有 AF，必须手动旋转镜头调焦；详见 `KNOWN_ISSUES.md`。
+
+摄像头默认按需启用，操作结束后会自动休眠并释放驱动。因此，在尚未执行预览或扫码完成唤醒、预热时，Web 总览和硬件诊断显示“相机异常”属于正常现象。
 
 ## NFC
 

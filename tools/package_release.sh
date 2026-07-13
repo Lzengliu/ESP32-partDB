@@ -31,7 +31,7 @@ fi
 rm -rf "$DIST"
 mkdir -p "$SOURCE" "$RELEASE"
 
-for name in .gitignore AUTHORS.md LICENSE NOTICE.md README.md; do
+for name in .gitignore AUTHORS.md LICENSE NOTICE.md README.md README_EN.md; do
     cp "$ROOT/$name" "$SOURCE/$name"
 done
 
@@ -61,7 +61,9 @@ cp "$ROOT/LICENSE" "$RELEASE/LICENSE"
 cp "$ROOT/NOTICE.md" "$RELEASE/NOTICE.md"
 cp "$ROOT/AUTHORS.md" "$RELEASE/AUTHORS.md"
 cp "$ROOT/docs/RELEASE_V1.1.md" "$RELEASE/README_V1.1.md"
+cp "$ROOT/docs/RELEASE_V1.1_EN.md" "$RELEASE/README_V1.1_EN.md"
 cp "$ROOT/docs/CHANGES_V1.0_TO_V1.1.md" "$RELEASE/CHANGES_V1.0_TO_V1.1.md"
+cp "$ROOT/docs/CHANGES_V1.0_TO_V1.1_EN.md" "$RELEASE/CHANGES_V1.0_TO_V1.1_EN.md"
 cp "$ROOT/docs/licenses/OFL-1.1.txt" "$RELEASE/OFL-1.1.txt"
 cp "$ROOT/docs/licenses/ISC-quirc.txt" "$RELEASE/ISC-quirc.txt"
 cp "$ROOT/third_party/zxing-cpp/LICENSE" "$RELEASE/ZXING-CXX-LICENSE"

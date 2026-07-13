@@ -19,6 +19,17 @@ Current prototype wiring:
 
 See `docs/wiring-and-bringup.md` for the complete wiring table.
 
+## First Boot and Management AP
+
+On a fresh device or while WiFi is not configured, connect to the default AP:
+
+- SSID: `PartDB-Terminal`
+- Password: `partdb1234`
+- Web management URL: `http://192.168.4.1/`
+
+Open the URL in a browser after connecting, then configure WiFi, Part-DB, and
+the required device options.
+
 ## Build
 
 ESP-IDF v5.5.2 is the verified toolchain.
